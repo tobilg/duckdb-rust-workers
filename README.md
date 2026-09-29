@@ -1,6 +1,8 @@
 # DuckDB on Cloudflare Workers
 
-Query remote Parquet, JSON, and CSV files with DuckDB directly inside a
+Cloudflare announced on 2026-09-28 that they now [Rust Workers via Emscripten](https://blog.cloudflare.com/rust-workers-emscripten-target/). This project enables [DuckDB](https://duckdb.org) builds via Emscripten, and deploys them via Rust/Wasm to the Cloudflare Workers platform.
+
+You can query remote Parquet, JSON, and CSV files with DuckDB directly inside a
 Cloudflare Worker. The request handler and application logic are written in
 Rust, linked with DuckDB into a single WebAssembly module using Emscripten.
 Network reads use Workers `fetch()` and JSPI to suspend and resume native code.
