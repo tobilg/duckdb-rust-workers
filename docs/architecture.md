@@ -120,7 +120,8 @@ snapshots and failed reads. Exceeding it returns `query_transfer_limit` and
 releases the request state. Cached ranges consume no additional transfer.
 
 Only the completed bounded response buffer crosses back into an HTTP
-response. Row limits stop the result stream early; a byte breach discards
+response. An optional `max_rows` stops the result stream early; omitting it
+returns all rows within the response-byte budget. A byte breach discards
 partial JSON and returns a small 413 error. Parameters, credentials embedded
 in signed URLs/headers, and version state do not survive the request-owned
 database or context.

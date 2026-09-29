@@ -1,28 +1,25 @@
-# Rust DuckDB Worker evaluation
+# DuckDB on Cloudflare Workers
 
-DuckDB 2.0 and Rust linked into one Emscripten Wasm module, with synchronous
-native HTTP reads suspended through JSPI and real Workers `fetch()`.
-`core_functions`, `parquet`, `json`, and `httpfs` are statically registered.
-This is a trusted-caller evaluation, not a production SQL service.
+Query remote Parquet, JSON, and CSV files with DuckDB directly inside a
+Cloudflare Worker. The request handler and application logic are written in
+Rust, linked with DuckDB into a single WebAssembly module using Emscripten.
+Network reads use Workers `fetch()` and JSPI to suspend and resume native code.
 
-Validation generates `artifacts/validation-report.md` with acceptance results
-and limitations, and `artifacts/build-manifest.json` with exact pins, flags,
-checksums, and output identities. The entire `artifacts/` directory is ignored
-by Git and can be deleted. Run `./scripts/validate.sh` to regenerate it before
-artifact verification. Wrangler uploads the Worker modules from `build/`.
+The project uses DuckDB **v2.0-cyanoptera**, with `core_functions`, `parquet`,
+`json`, and `httpfs` built in. It provides an authenticated, read-only SQL API
+with parameterized queries, bounded results, and configurable transfer limits.
+Each request runs against a fresh in-memory database.
 
-## Reproduce locally
+This is an experimental project for trusted callers. See
+[runtime limits](#runtime-limits) for its operational constraints.
 
-The evaluated build host is macOS arm64. Bootstrap deliberately rejects other
-hosts rather than selecting unverified binary assets. Prerequisites: Git,
-Python 3.11+, CMake, Ninja, rustup, OpenSSL CLI, and Node **22.22.2** (`.nvmrc`).
-Allow several GiB of disk, plus compiler temporary space. Bootstrap downloads
-immutable sources and checksum-verified tool archives into this checkout;
-it does not modify a shared Emscripten SDK.
+## Build and test
 
-Vendor changes are stored in `patches/` and declared in `toolchain-lock.json`.
-Bootstrap applies them automatically; builds reject unrecorded vendor edits.
-See [build notes](docs/build-notes.md) for the patch inventory.
+The bootstrap currently supports **macOS arm64**. Install Git, Python 3.11+,
+CMake, Ninja, rustup, the OpenSSL CLI, and Node **22.22.2** (see `.nvmrc`).
+Allow several GiB of disk space for the toolchain and native build.
+
+Run from the repository root:
 
 ```sh
 ./scripts/bootstrap-toolchain.sh
@@ -30,190 +27,74 @@ npm ci
 ./scripts/validate.sh
 ```
 
-`validate.sh` builds the Worker, runs the local tests, performs a packaging dry
-run and startup profile, then generates and verifies the manifest and report.
-It also works after `artifacts/` has been cleared. `verify-artifact.sh` checks
-an existing manifest; it does not create one or run tests.
+Bootstrap installs pinned tools and sources into the checkout without changing
+a shared Emscripten SDK. Dependency patches are tracked in `patches/`, declared
+in `toolchain-lock.json`, and applied automatically. Builds reject unrecorded
+changes to vendored dependencies.
 
-The build compiles DuckDB and its four static extensions, then links the Rust
-API into the Worker. Native compilation uses two jobs by default
-(`NATIVE_JOBS=4` to change it).
-`SMALLER_BINARY=ON` retains only the window specializations justified by the
-[benchmarks](docs/performance.md); native compilation and linking still use `-Oz`.
-Subsequent builds are incremental. Testing generates the large fixture using
-the separately pinned native DuckDB 1.5.5 CLI; this is only a fixture generator,
-not the Worker engine. Tests start actual workerd and a local TLS fixture
-server. Their temporary certificate is trusted only by that workerd process.
-The harness selects free local ports. No Cloudflare account is needed.
+Validation builds the Worker, runs integration tests in local workerd,
+performs a deployment packaging dry run, and profiles startup. It requires
+no Cloudflare account and does not deploy the Worker. Tests use a local HTTPS
+fixture server and cover JSPI suspension, native exceptions, built-in
+extensions, remote reads, transfer and output limits, cleanup, and overlapping
+requests.
 
-The integration suite exercises the full API, including real JSPI suspension,
-native exceptions before and after remote reads, static extension loading,
-output bounds, request cleanup, and same-module overlap rejection.
+The resulting package is `build/index.js` and `build/index_bg.wasm`. Subsequent
+builds are incremental. Native compilation uses two jobs by default; set
+`NATIVE_JOBS` to adjust it, for example `NATIVE_JOBS=4 ./scripts/validate.sh`.
 
-`build/index.js` and `build/index_bg.wasm` form the local package. Verify its
-manifest before deployment. `./scripts/build-native.sh` can rebuild only the
-native archives when working on the C++ dependencies.
-A packaging dry run does not upload or establish deployed startup/runtime
-compatibility. Publishing an endpoint is outside these commands.
+To run individual steps:
+
+```sh
+./scripts/build-worker.sh
+./scripts/test-local.sh
+```
+
+Generated logs, measurements, `build-manifest.json`, and `validation-report.md`
+are written to the Git-ignored `artifacts/` directory. It can be deleted;
+`./scripts/validate.sh` regenerates it. `./scripts/verify-artifact.sh` checks an
+existing manifest against the build outputs.
 
 ## Deploy to Cloudflare
 
-The project owner confirmed that the public GitHub Parquet example works on a
-deployed Cloudflare Worker. The configurable transfer-budget update has only
-local validation so far. The full deployed acceptance suite, authenticated
-S3 checks and total isolate-memory measurements remain pending.
-
-Install the prerequisites from the local workflow above first.
-Use an authorized Workers Paid test account with a workers.dev subdomain;
-the deploy command below publishes an endpoint and its requests use that
-account's quota.
-
-Use remote Parquet, JSON, or CSV files served over HTTPS to test the Worker.
-Large files require strong ETags and byte-range support. Files with weak or
-missing ETags, or servers that ignore Range, use one bounded full GET, with a
-4 MiB total full-read budget per API request. DuckDB reuses that snapshot
-through preparation and execution, including literal URLs and repeated reads.
-Malformed ranges and changed object versions remain errors.
-
-### Configure the Worker
-
-The default configuration permits remote reads from any HTTPS origin and path.
-To restrict sources, add these optional top-level settings to `wrangler.jsonc`,
-using your own host and path prefix. Keep the existing build and compatibility
-settings. These commands use the top-level Worker configuration.
-
-```jsonc
-{
-  "workers_dev": true,
-  "vars": {
-    "ALLOWED_ORIGIN": "https://data.example.com",
-    "ALLOWED_PATH_PREFIX": "/data/"
-  }
-}
-```
-
-The default query transfer budget is **64 MiB**. To change it, set
-`QUERY_TRANSFER_LIMIT_MIB` in the top-level `vars` in `wrangler.jsonc`:
-
-```jsonc
-{
-  "vars": {
-    "QUERY_TRANSFER_LIMIT_MIB": "128"
-  }
-}
-```
-
-This limits cumulative response-body bytes fetched across all files in one
-query, including failed reads; cache hits consume no transfer budget. It is
-a transfer allowance, not a memory allocation. Use a positive whole number
-of MiB (up to 4,294,967,295); zero, malformed or out-of-range settings return
-a configuration error. Omit the setting to use 64 MiB. Per-response and
-full-download limits are listed under [Budgets and boundaries](#budgets-and-boundaries).
-
-Wrangler runs the configured Rust build and bundles `build/index.js` and
-`build/index_bg.wasm` for upload. Rebuild and rerun local validation before
-deploying any source or toolchain changes.
-`API_KEY` belongs in a secret, not in `vars` or a committed file.
-
-### Authenticate, verify, and publish
-
-Run these commands from the repository root with the pinned Node/npm tools:
+Complete the local setup above and use a Cloudflare Workers Paid account.
+Set the Worker name in `wrangler.jsonc`, then authenticate and deploy:
 
 ```sh
 npx --no-install wrangler login
-npx --no-install wrangler whoami
-export CLOUDFLARE_ACCOUNT_ID='your-test-account-id'
-
-./scripts/validate.sh
-
-# These commands publish the Worker and then configure its API secret.
 npx --no-install wrangler deploy
 npx --no-install wrangler secret put API_KEY
 ```
 
-Enter a long random API key at the interactive secret prompt and retain it in
-your password manager. On the first deployment, queries return 401 until the
-secret is set because local access is disabled. Afterward, missing or incorrect
-bearer tokens return 403; `/healthz` remains unauthenticated. Setting or rotating
-a secret creates and immediately deploys a new Worker version, so record the
-final version ID after that step. See [Wrangler secret behavior](https://developers.cloudflare.com/workers/configuration/secrets/).
+Wrangler runs the configured build before uploading the Worker. Enter a long,
+random API key at the secret prompt and save it for client requests. Queries
+are rejected until the secret is configured. `/healthz` is unauthenticated.
+The commands use the top-level configuration; no named Worker environment is
+required.
 
-For CI, supply `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` through the CI
-secret store instead of running `wrangler login`. The Cloudflare API token
-authorizes deployment; it is distinct from the Worker's `API_KEY`.
+If you have multiple Cloudflare accounts, set `CLOUDFLARE_ACCOUNT_ID` to select
+one. For CI, provide `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` through
+your CI secret store instead of using `wrangler login`. The Cloudflare API
+token authorizes deployments; `API_KEY` authenticates SQL requests.
 
-### Check the deployed Worker
+## Query examples
 
-Check health using the URL printed by Wrangler:
-
-```sh
-curl --fail-with-body 'https://duckdb-rust-workers.your-subdomain.workers.dev/healthz'
-```
-
-Health should report `busy: false` and `fatal: false` when idle.
-
-To test remote Parquet, JSON, or CSV files, use `read_parquet(?)`,
-`read_json_auto(?)`, or `read_csv_auto(?)` in a `POST /v1/query` request.
-Pass the file URL in `params` and send `Authorization: Bearer <API_KEY>`.
-Configured `ALLOWED_ORIGIN` and `ALLOWED_PATH_PREFIX` restrictions apply to
-these URLs. The local integration suite covers Parquet and JSON.
-
-Use `npx --no-install wrangler tail` while checking failures.
-A 502 can indicate an origin/path mismatch, a transfer limit, invalid range
-response, or upstream failure; 504 indicates the I/O deadline.
-These responses include `error.diagnostic` with a reason code, HEAD/GET method,
-and upstream status when a response was received, plus fetch counters in
-`metrics`. For example:
-
-```json
-{"reason":"full_download_limit","method":"HEAD","upstream_status":200}
-```
-
-`source_policy` means the URL restriction rejected the read;
-`upstream_http_status` reports an HTTP error from the source;
-`fetch_failed`/`fetch_type_error` mean fetch failed before a response;
-`missing_etag`/`weak_etag` identify an unvalidated range response;
-`invalid_content_range` identifies a malformed range response;
-`response_body_limit` means a response exceeded its transfer cap;
-`query_transfer_limit` means a query exceeded `QUERY_TRANSFER_LIMIT_MIB`;
-`full_download_limit` means a full read would exceed the 4 MiB query budget.
-Diagnostics exclude URLs, credentials, raw headers, and exception messages.
-Retain the complete error JSON when reporting a deployed failure.
-
-Remote range bytes are cached only within the active API request, with a
-4 MiB cache budget. `metrics.cache_hits`, `cache_peak_bytes`, and
-`staging_peak_bytes` describe reuse, accounted cache storage, and the largest
-transport body buffer. They do not measure total isolate memory. Fetch counts
-and bytes include actual network reads, including failed reads; cache hits
-do not increase them. See [performance evaluation](docs/performance.md) for
-benchmarks and optional tuning settings.
-
-The local integration suite is not a deployed test runner. Repeat the large-object and
-error cases against remote test files before claiming deployed
-acceptance, and retain server range logs and response metrics.
-
-Record the account, Worker name, final version ID, tested artifact SHA-256,
-upload size, reported startup time, query results, and available platform
-CPU/memory outcomes in a separate deployment report. `/healthz` reports only
-Wasm linear memory. Leave total isolate memory and S3 checks marked pending
-until measured. Keep the existing local validation report as local evidence.
-
-For a later deployment with a known working previous version, rollback with
-`npx --no-install wrangler rollback <VERSION_ID>`.
-
-### Query with curl
-
-Set your Worker URL and read the API key interactively (paste it, then press
-Enter). The examples pass authentication through stdin to keep the key out of
-curl's command-line arguments. Leave the origin/path restrictions unset for
-these examples, or configure them to allow the data URLs you use.
+Set the URL printed by Wrangler and read your API key interactively. The
+examples pass the authorization header through stdin to keep the key out of
+curl's command-line arguments.
 
 ```sh
 export WORKER_URL='https://duckdb-rust-workers.your-subdomain.workers.dev'
 read -r -s API_KEY
 ```
 
-Run local SQL:
+Check health:
+
+```sh
+curl --fail-with-body "$WORKER_URL/healthz"
+```
+
+Run SQL without a remote data source:
 
 ```sh
 curl --fail-with-body --header @- --json '{"sql":"SELECT 42 AS answer"}' \
@@ -222,8 +103,7 @@ Authorization: Bearer $API_KEY
 EOF
 ```
 
-Aggregate the public cloud provider IP ranges Parquet file. Passing the URL
-as a parameter is equivalent to `FROM 'https://…/all.parquet'`:
+Aggregate a public Parquet file containing cloud provider IP ranges:
 
 ```sh
 curl --fail-with-body --header @- --json '{
@@ -234,7 +114,7 @@ Authorization: Bearer $API_KEY
 EOF
 ```
 
-Read a JSON file (replace the example URL with your file):
+Read JSON or CSV by replacing the placeholder URLs with your own HTTPS files:
 
 ```sh
 curl --fail-with-body --header @- --json '{
@@ -244,81 +124,165 @@ curl --fail-with-body --header @- --json '{
 }' "$WORKER_URL/v1/query" <<EOF
 Authorization: Bearer $API_KEY
 EOF
+
+curl --fail-with-body --header @- --json '{
+  "sql": "SELECT * FROM read_csv_auto(?)",
+  "params": ["https://data.example.com/data/example.csv"],
+  "max_rows": 10
+}' "$WORKER_URL/v1/query" <<EOF
+Authorization: Bearer $API_KEY
+EOF
 ```
 
-For CSV, use `read_csv_auto(?)` and a CSV URL. When finished, run `unset API_KEY`.
+Remote reads allow any HTTPS origin by default. If source restrictions are
+configured, they must permit the URLs used in your queries. Large objects
+require byte-range support and strong ETags; see [remote reads](#remote-reads).
+Run `unset API_KEY` when finished.
+
+## Configuration
+
+Set non-secret bindings in the top-level `vars` object in `wrangler.jsonc`.
+Store `API_KEY` with `wrangler secret put API_KEY`.
+
+| Binding | Default | Purpose |
+| --- | --- | --- |
+| `API_KEY` | Unset; queries rejected | Secret used for `Authorization: Bearer <API_KEY>`. |
+| `QUERY_TRANSFER_LIMIT_MIB` | `"64"` | Maximum cumulative response-body bytes fetched per query, in MiB. |
+| `ALLOWED_ORIGIN` | Any HTTPS origin | Optionally restrict remote reads to one origin, such as `https://data.example.com`. This is an outbound source restriction, not a CORS setting. |
+| `ALLOWED_PATH_PREFIX` | `"/"` | Restrict remote reads to a path prefix, such as `/data/`. Applies to every allowed origin. |
+| `LOCAL_EVALUATION` | Unset | Set to `"1"` to allow unauthenticated queries when `API_KEY` is absent. Intended for local testing; leave unset when deploying. |
+
+For example, to raise the transfer budget to **128 MiB**, update the existing
+`vars` object:
+
+```jsonc
+{
+  "vars": {
+    "QUERY_TRANSFER_LIMIT_MIB": "128"
+  }
+}
+```
+
+The transfer budget counts consumed response-body bytes across all files in
+a query, including failed reads. Cache hits consume no transfer budget.
+Increasing it does not allocate more memory or change the per-response and
+full-download limits. Values must be strings containing positive whole
+numbers of MiB, up to 4,294,967,295; invalid values return a configuration
+error. Omitting the binding uses 64 MiB.
+
+Origin and path restrictions also apply to redirects. `LOCAL_EVALUATION`
+does not detect where the Worker is running; it enables the same authentication
+bypass locally and when deployed if no API key is configured.
+
+See [performance tuning](docs/performance.md) for `RANGE_CACHE_BLOCK_BYTES`
+and `PARQUET_PREFETCH_COLUMN_GAP`.
 
 ## API
 
-`POST /v1/query` accepts a JSON object with `sql`, optional scalar `params`, and
-optional `max_rows`. `GET /healthz` reports module busy/fatal state and allocated
-Wasm linear memory. Responses include column names/types, row arrays,
-`truncated`, a request ID, and wall/network metrics.
+### `POST /v1/query`
 
-```json
-{"sql":"SELECT * FROM read_parquet(?)","params":["https://data.example.com/data/example.parquet"],"max_rows":10}
-```
+Send a JSON body with a bearer token:
 
-Omit `ALLOWED_ORIGIN` to allow any HTTPS origin, or set it to restrict reads
-to one origin. `ALLOWED_PATH_PREFIX` defaults to `/` (all paths) and can narrow
-reads to a prefix such as `/data/`. Local SQL works with both settings unset.
-A malformed configured origin returns a configuration error; it does not
-disable the restriction. Set secret `API_KEY` for bearer authentication.
+| Field | Type | Description |
+| --- | --- | --- |
+| `sql` | String, required | One SQL statement with optional `?` parameter placeholders. |
+| `params` | Array, optional | Positional parameters: strings, numbers, booleans, or null. Defaults to `[]`. |
+| `max_rows` | Integer, optional | Cap returned rows from 1 to 10,000. Omit it to return all rows, subject to the response-size limit. |
 
-For local testing without an API key, `LOCAL_EVALUATION=1` permits
-unauthenticated queries only when `API_KEY` is absent. This flag does not detect
-whether the Worker is running locally; leave it unset for deployments.
+Successful responses contain column names and DuckDB types, row arrays,
+`truncated`, a request ID, and timing/network metrics. Row arrays preserve
+duplicate column names. Without `max_rows`, all rows are returned. When a cap
+is supplied, results beyond it are omitted and `truncated` is `true`.
+Exceeding the 1 MiB serialized output budget returns 413 rather than a partial
+result, with or without `max_rows`.
 
-Rust owns validation, authentication, URL policy, serialization, and the busy
-state. DuckDB parses exactly one statement. SELECT must report no modified
-databases. ATTACH is accepted with read-only forced by the bridge; attachments
-exist only for that request. DuckLake/quack extensions are not included.
-Mutation, configuration SQL, INSTALL, and user LOAD are rejected. This policy
-is for trusted callers, not an adversarial SQL sandbox.
+Integers outside JavaScript's safe range and exact decimals are encoded as
+strings. Dates and timestamps are strings; non-finite floats are `"NaN"`,
+`"Infinity"`, or `"-Infinity"`. Complex result types return 400.
 
-Integers outside JavaScript's safe range and exact decimals are strings;
-dates/timestamps are strings, non-finite floats are `"NaN"`, `"Infinity"`, or
-`"-Infinity"`. Duplicate names are preserved by row arrays. Complex types
-return 400 until an encoding is defined. Errors are sanitized and use
-400/401/403/413/429/500/502/504 according to their category.
+The API accepts read-only SELECT statements and forces ATTACH statements to
+be read-only. Attachments exist only for the current request. Mutations,
+configuration SQL, INSTALL, and user LOAD are rejected. DuckLake and quack
+extensions are not included. This policy is intended for trusted callers
+and does not provide an adversarial SQL sandbox.
 
-## Budgets and boundaries
+### `GET /healthz`
 
-Each request owns a fresh in-memory database and connection. Only one query
-may run per module; an overlapping request gets 429. Native exceptions are
-caught before crossing into Rust. A Wasm trap marks the module unusable.
+Returns `busy`, `fatal`, `request_id`, and `wasm_memory_bytes` without
+authentication. An idle, healthy module reports `busy: false` and
+`fatal: false`. Memory is allocated Wasm linear memory, not total isolate
+memory.
 
-| Resource | Bound |
+### Errors and diagnostics
+
+Errors include `request_id` and an `error` object with `category` and `message`.
+
+| Status | Meaning |
 | --- | --- |
-| Input / serialized output | 64 KiB / 1 MiB |
-| Rows / columns / parameters | Default 1,000, maximum 10,000 / 256 / 256 |
-| Linear memory / DuckDB managed memory | 96 MiB / 48 MiB |
-| Execution / async threads | 1 / 0 |
-| Spill / external file cache | Disabled / disabled |
-| Response body / query transfer | 8 MiB / 64 MiB default (`QUERY_TRANSFER_LIMIT_MIB`) |
-| Full reads and request-owned input snapshots | 4 MiB total per query |
-| Transport range cache | 4 MiB charged storage, at most 64 entries per request |
+| 400 | Invalid input, rejected SQL, or unsupported result type. |
+| 401 | API key has not been configured. |
+| 403 | Missing or incorrect bearer token. |
+| 413 | Serialized result exceeds the output budget. |
+| 429 | Another query is active in the same module. |
+| 500 | Invalid configuration or engine/module failure. |
+| 502 | Remote read failed or violated source/transfer policy. |
+| 504 | Remote read deadline exceeded. |
+
+Remote-read errors can include `error.diagnostic` with a reason, HTTP method,
+and upstream status. Common reasons are `source_policy`,
+`upstream_http_status`, `invalid_content_range`, `response_body_limit`,
+`query_transfer_limit`, and `full_download_limit`. Diagnostics omit source
+URLs, credentials, and raw exception messages.
+
+Use `npx --no-install wrangler tail` to inspect deployed Worker logs. Response
+metrics include fetch counts and bytes, cache hits, peak cache storage, and
+peak transport staging bytes. These counters describe query activity rather
+than total isolate memory.
+
+## Runtime limits
+
+Each request owns its database, connection, and input caches. Only one query
+can run per module at a time; overlapping requests receive 429. There is no
+persistence or spill to disk. Fetches run sequentially.
+
+| Resource | Limit |
+| --- | --- |
+| Request body / serialized response | 64 KiB / 1 MiB |
+| Rows | All by default; optional `max_rows` cap from 1 to 10,000 |
+| Columns / parameters | 256 / 256 |
+| Wasm linear memory / DuckDB managed memory | 96 MiB / 48 MiB |
+| Individual response body | 8 MiB |
+| Query transfer | 64 MiB by default; configurable with `QUERY_TRANSFER_LIMIT_MIB` |
+| Full-download snapshots | 4 MiB total per query |
+| Range cache | 4 MiB, at most 64 entries per request |
 | Fetch wait / query I/O deadline | 10 s / 30 s |
-| Fetch concurrency / attempts | 1 / at most 3 including redirects |
+| Fetch attempts | At most 3, including redirects |
 
-The host copies response chunks only into a current Wasm memory view after
-awaiting them. Outbound HEAD/GET requests use `Accept-Encoding: identity`.
-Range reads require strong ETags. Weak or missing validators select httpfs's
-full-download cache, bounded to 4 MiB across full reads in the query. Known
-oversized objects are rejected at HEAD; unknown lengths are capped while
-streaming. Snapshots are released with the request-owned database.
-The adapter cancels error/timeout bodies, checks ranges, and
-applies the configured origin/path restrictions to every redirect. Only absolute
-HTTPS redirects are supported. Cross-origin redirects retain range/cache/accept
-headers and drop origin-specific headers such as authorization and cookies. Range-ignored large objects
-are rejected; they are never downloaded wholesale to satisfy a query.
+Wasm can retain allocated memory after a request completes. Its linear-memory
+limit does not cap total isolate memory. JavaScript timers cannot interrupt
+CPU-bound Wasm, so the I/O deadline is not a hard CPU deadline.
 
-The memory settings do **not** measure or cap total isolate memory. Wasm may
-retain its allocated high-water memory after cleanup. JavaScript timers
-cannot preempt CPU-bound Wasm; the I/O deadline is not a hard CPU deadline.
-No pthread scheduler or automatic concurrent read-ahead is supplied by JSPI.
-The linked httpfs signing/cryptography path is retained, but authenticated
-S3 behavior requires separate credentials and validation.
+### Remote reads
 
-See [architecture](docs/architecture.md), [build notes](docs/build-notes.md),
-and [third-party notices](THIRD_PARTY_NOTICES.md).
+Large files are read with byte ranges and strong ETags to detect object
+changes between requests. Weak or missing ETags, or a server that ignores
+Range, trigger a bounded full download through httpfs. Full-download
+snapshots share a **4 MiB budget per query** and are reused during query
+preparation and execution. Larger objects that require a full download are
+rejected. Malformed ranges and changed object versions are also rejected.
+
+Only HTTPS sources and absolute HTTPS redirects are supported. Cross-origin
+redirects strip origin-specific headers such as authorization and cookies.
+The httpfs S3 signing and cryptography code is included; authenticated S3
+access is not covered by the integration suite.
+
+## Further documentation
+
+- [Architecture](docs/architecture.md): Rust/C++ boundary, JSPI, request lifecycle, and HTTP transport.
+- [Build notes](docs/build-notes.md): toolchain pins, dependency patches, and compilation details.
+- [Performance](docs/performance.md): benchmarks, memory accounting, and tuning options.
+
+## License
+
+[MIT](LICENSE). Dependency licenses are listed in
+[third-party notices](THIRD_PARTY_NOTICES.md).

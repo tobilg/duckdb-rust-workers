@@ -33,7 +33,7 @@ pub struct QueryContext {
     allowed_origin: Option<url::Origin>,
     prefix: String,
     output: Vec<u8>,
-    max_rows: u32,
+    max_rows: Option<u32>,
     rows: u32,
     columns: u32,
     cells: u32,
@@ -170,8 +170,8 @@ pub async fn query(mut req: Request, env: Env, id: u32) -> Result<Response> {
         Ok(v) => v,
         Err(_) => return error(id, 400),
     };
-    let max_rows = input.max_rows.unwrap_or(1000);
-    if max_rows == 0 || max_rows > 10000 || input.params.len() > 256 {
+    let max_rows = input.max_rows;
+    if max_rows.is_some_and(|limit| limit == 0 || limit > 10000) || input.params.len() > 256 {
         return error(id, 400);
     }
     let sql = match CString::new(input.sql) {
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn eval_begin_rows(p: *mut QueryContext) -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn eval_row_begin(p: *mut QueryContext) -> i32 {
     let c = context(p);
-    if c.rows >= c.max_rows {
+    if c.max_rows.is_some_and(|limit| c.rows >= limit) {
         c.truncated = true;
         return 0;
     }

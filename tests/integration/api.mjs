@@ -81,7 +81,9 @@ try {
    assert.equal(r.status,403);
   }
   assert.equal((await query('x'.repeat(65536))).status,400);
-  assert.equal((await query('SELECT 1',[],{max_rows:10001})).status,400);
+  for(const max_rows of [0,-1,1.5,'3',10001]) {
+   assert.equal((await query('SELECT 1',[],{max_rows})).status,400);
+  }
   assert.equal((await query('SELECT ?',[[1]])).status,400);
  });
  await check('local SQL',async()=>{const r=await query('SELECT 42 AS answer');assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[42]]);});
@@ -150,7 +152,36 @@ try {
   for(const sql of ['SELECT 1; SELECT 2','CREATE TABLE x(i INT)',"INSTALL httpfs","LOAD httpfs","SET threads=2",'SELECT [1,2]']) assert.equal((await query(sql)).status,400,sql);
  });
  await check('row limit streams a huge result',async()=>{const r=await query('SELECT i FROM range(1000000000) t(i)',[],{max_rows:3});assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[0],[1],[2]]);assert.equal(r.body.truncated,true);});
- await check('byte limit and recovery',async()=>{assert.equal((await query("SELECT repeat('x',600000) FROM range(2)")).status,413);assert.equal((await query('SELECT 42')).status,200);});
+ await check('omitted or null max_rows returns all rows',async()=>{
+  const expected=Array.from({length:12000},(_,i)=>[i]);
+  for(const options of [{},{max_rows:null}]) {
+   const r=await query('SELECT i FROM range(12000) t(i)',[],options);
+   assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,expected);
+   assert.equal(r.body.truncated,false);
+  }
+ });
+ await check('explicit row caps only mark results truncated when rows are omitted',async()=>{
+  for(const [count,max_rows] of [[0,1],[1,1],[2,1],[3,3],[4,3],[10000,10000],[10001,10000]]) {
+   const r=await query('SELECT i FROM range(?) t(i)',[count],{max_rows});
+   assert.equal(r.status,200,JSON.stringify(r));
+   assert.deepEqual(r.body.rows,Array.from({length:Math.min(count,max_rows)},(_,i)=>[i]));
+   assert.equal(r.body.truncated,count>max_rows);
+  }
+  const empty=await query('SELECT i FROM range(0) t(i)');
+  assert.equal(empty.status,200,JSON.stringify(empty));assert.deepEqual(empty.body.rows,[]);
+  assert.equal(empty.body.truncated,false);
+ });
+ await check('byte limit stops uncapped results and recovers',async()=>{
+  for(const sql of ["SELECT repeat('x',600000) FROM range(2)",'SELECT i FROM range(1000000000) t(i)']) {
+   const r=await query(sql);
+   assert.equal(r.status,413,JSON.stringify(r));assert.equal(r.body.error.category,'output_limit');
+   assert.equal(r.body.rows,undefined);
+   const state=await health();assert.equal(state.busy,false);assert.equal(state.fatal,false);
+   const recovered=await query('SELECT 42');
+   assert.equal(recovered.status,200,JSON.stringify(recovered));assert.deepEqual(recovered.body.rows,[[42]]);
+   assert.equal(recovered.body.truncated,false);
+  }
+ });
  await check('remote JSON',async()=>{const r=await query('SELECT sum(value)::BIGINT FROM read_json_auto(?) WHERE category=?',[`${fixture.origin}/data/small.json`,'a']);assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[40]]);report.json=r.body.metrics;});
  await check('JSPI resumes a successful delayed fetch while the same module progresses',async()=>{
   const mark=fixture.requests.length;
