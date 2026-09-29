@@ -1,0 +1,29 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 564d21c..c215ff1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -16,6 +16,7 @@ endif()
+ if(NOT EMSCRIPTEN)
+   add_definitions(-DOVERRIDE_ENCRYPTION_UTILS=1)
+ else()
++  add_definitions(-DEMSCRIPTEN)
+   set(DUCKDB_EXTENSION_HTTPFS_LINKED_LIBS
+       "../../third_party/mbedtls/libduckdb_mbedtls.a")
+ endif()
+@@ -24,10 +25,12 @@ if(MINGW)
+   set(OPENSSL_USE_STATIC_LIBS TRUE)
+ endif()
+ 
+-find_package(OpenSSL REQUIRED)
+-find_package(CURL REQUIRED)
+-include_directories(${OPENSSL_INCLUDE_DIR})
+-include_directories(${CURL_INCLUDE_DIRS})
++if(NOT EMSCRIPTEN)
++  find_package(OpenSSL REQUIRED)
++  find_package(CURL REQUIRED)
++  include_directories(${OPENSSL_INCLUDE_DIR})
++  include_directories(${CURL_INCLUDE_DIRS})
++endif()
+ 
+ include_directories(src/include ${DUCKDB_MODULE_BASE_DIR}/third_party/httplib)
+ add_subdirectory(src)

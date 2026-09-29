@@ -1,0 +1,19 @@
+diff --git a/worker-build/src/binary.rs b/worker-build/src/binary.rs
+index 61896dc..ca718fa 100644
+--- a/worker-build/src/binary.rs
++++ b/worker-build/src/binary.rs
+@@ -120,9 +120,11 @@ fn remove_all_versions(name: &str, target: &str) -> Result<usize> {
+ 
+ /// Root of the worker-build cache directory
+ pub(crate) fn cache_root() -> Result<PathBuf> {
+-    let path = dirs_next::cache_dir()
+-        .unwrap_or_else(std::env::temp_dir)
+-        .join("worker-build");
++    let path = env::var_os("WORKER_BUILD_CACHE")
++        .map(PathBuf::from)
++        .unwrap_or_else(|| dirs_next::cache_dir()
++            .unwrap_or_else(std::env::temp_dir)
++            .join("worker-build"));
+     if !path.exists() {
+         create_dir_all(&path)
+             .with_context(|| format!("Failed to create cache directory {}", path.display()))?;

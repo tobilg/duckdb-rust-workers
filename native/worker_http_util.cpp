@@ -1,0 +1,221 @@
+#include "worker_http_util.hpp"
+#include "duckdb/common/string_util.hpp"
+#include <emscripten.h>
+#include <algorithm>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+
+extern "C" int eval_url_allowed(void *, const char *, uint32_t);
+extern "C" int eval_same_origin(const char *, uint32_t, const char *, uint32_t);
+
+EM_ASYNC_JS(int, worker_fetch, (const char *url, const char *headers_json, int head,
+    uint8_t *body, uint32_t capacity, char *metadata, uint32_t metadata_capacity,
+    uint32_t *received, uint32_t *upstream_status, char *failure_reason, int timeout_ms), {
+    const address = UTF8ToString(url);
+    const headers = new Headers(JSON.parse(UTF8ToString(headers_json)));
+    // Production Workers otherwise negotiate compression automatically. File
+    // offsets and strong validators must describe the unencoded representation.
+    headers.set('Accept-Encoding', 'identity');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout_ms);
+    let reader, count = 0, failure = '', phase = 'fetch';
+    const fail = (reason, status = 502) => { failure = reason; return -status; };
+    try {
+        const response = await globalThis.fetch(address, { method: head ? 'HEAD' : 'GET', headers,
+            redirect: 'manual', signal: controller.signal });
+        HEAPU32[upstream_status >>> 2] = response.status;
+        phase = 'body';
+        let info = String(response.status) + '\n';
+        for (const [key, value] of response.headers) {
+            info += key.toLowerCase() + ':' + value + '\n';
+            if (info.length > metadata_capacity) { if (response.body) await response.body.cancel(); return fail('response_headers_too_large'); }
+        }
+        const encoded = new TextEncoder().encode(info);
+        if (encoded.length + 1 > metadata_capacity) { if (response.body) await response.body.cancel(); return fail('response_headers_too_large'); }
+        HEAPU8.set(encoded, metadata); HEAPU8[metadata + encoded.length] = 0;
+        if (head || (response.status !== 200 && response.status !== 206)) {
+            if (response.body) await response.body.cancel();
+            return 0;
+        }
+        const declared = response.headers.get('content-length');
+        if (declared !== null && !/^[0-9]+$/.test(declared)) {
+            if (response.body) await response.body.cancel(); return fail('invalid_content_length');
+        }
+        if (declared !== null && BigInt(declared) > BigInt(capacity)) {
+            if (response.body) await response.body.cancel(); return fail('response_body_limit');
+        }
+        if (!response.body) return declared === '0' || declared === null ? 0 : fail('missing_response_body');
+        reader = response.body.getReader();
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            count += value.length;
+            if (count > capacity) { await reader.cancel(); return fail('response_body_limit'); }
+            // Reacquire the current Wasm view after every await.
+            HEAPU8.set(value, body + count - value.length);
+        }
+        if (declared !== null && BigInt(declared) !== BigInt(count)) return fail('content_length_mismatch');
+        return count;
+    } catch (error) {
+        if (reader) { try { await reader.cancel(); } catch (_) {} }
+        if (controller.signal.aborted) return fail('fetch_timeout', 504);
+        return fail(phase + (error instanceof TypeError ? '_type_error' : '_failed'));
+    } finally {
+        HEAPU32[received >>> 2] = count;
+        // Only fixed reason codes cross the bridge, never exception messages or
+        // URLs. The native caller supplies 64 bytes; all codes fit within 63.
+        const reason = new TextEncoder().encode(failure);
+        HEAPU8.set(reason, failure_reason); HEAPU8[failure_reason + reason.length] = 0;
+        clearTimeout(timer); controller.abort();
+        if (reader) reader.releaseLock();
+    }
+});
+
+namespace {
+constexpr uint64_t FULL_READ_BUDGET = 4 * 1024 * 1024;
+bool StrongETag(const std::string &etag) {
+    if (etag.size() < 2 || etag.front() != '"' || etag.back() != '"') return false;
+    for (size_t i = 1; i + 1 < etag.size(); ++i) {
+        const auto c = static_cast<unsigned char>(etag[i]);
+        if (c <= 0x20 || c == '"' || c == 0x7f) return false;
+    }
+    return true;
+}
+std::string Quote(const std::string &value) {
+    std::string out = "\"";
+    const char hex[] = "0123456789abcdef";
+    for (unsigned char c : value) {
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (c < 32) { out += "\\u00"; out += hex[c >> 4]; out += hex[c & 15]; }
+        else out += c;
+    }
+    return out + '"';
+}
+uint64_t Number(const std::string &s) {
+    if (s.empty() || s.find_first_not_of("0123456789") != std::string::npos)
+        throw duckdb::IOException("invalid range number");
+    try { return std::stoull(s); }
+    catch (const std::exception &) { throw duckdb::IOException("range overflow"); }
+}
+}
+
+duckdb::unique_ptr<duckdb::HTTPResponse> WorkerHTTPUtil::SendRequest(duckdb::BaseRequest &request,
+    duckdb::unique_ptr<duckdb::HTTPClient> &) {
+    using namespace duckdb;
+    auto fail = [&](int status, const char *reason) -> void {
+        state.error = status;
+        state.error_reason = reason;
+        throw IOException("Worker transport policy or upstream failure");
+    };
+    state.upstream_status = 0;
+    state.method = request.type == RequestType::HEAD_REQUEST ? 1 :
+                   request.type == RequestType::GET_REQUEST ? 2 : 0;
+    state.error_reason.clear();
+    if (request.type != RequestType::GET_REQUEST && request.type != RequestType::HEAD_REQUEST) fail(502, "unsupported_http_method");
+    std::string address = request.url;
+    for (unsigned redirects = 0; redirects < 3; ++redirects) {
+        state.upstream_status = 0;
+        if (!eval_url_allowed(state.context, address.data(), address.size())) fail(502, "source_policy");
+        const bool same_origin = eval_same_origin(request.url.data(), request.url.size(), address.data(), address.size());
+        std::string headers = "{";
+        bool first = true;
+        for (const auto &h : request.headers) {
+            // Cross-origin redirects retain only read/range/cache headers.
+            // Authorization, cookies, signing headers and custom credentials
+            // belong to the original origin, even when no origin is restricted.
+            const auto name = StringUtil::Lower(h.first);
+            if (!same_origin && name != "range" && name != "accept" && name != "accept-encoding" &&
+                name != "if-match" && name != "if-none-match" && name != "if-modified-since" &&
+                name != "if-unmodified-since") continue;
+            if (!first) headers += ',';
+            first = false; headers += Quote(h.first) + ':' + Quote(h.second);
+        }
+        headers += '}';
+        const auto remaining_ms = state.deadline - emscripten_get_now();
+        if (remaining_ms <= 0) fail(504, "query_io_deadline");
+        if (state.bytes >= 32 * 1024 * 1024) fail(502, "query_transfer_limit");
+        const bool head = request.type == RequestType::HEAD_REQUEST;
+        const bool range = !head && request.headers.HasHeader("Range");
+        const bool full_read = !head && !range;
+        if (full_read && state.full_read_bytes >= FULL_READ_BUDGET) fail(502, "full_download_limit");
+        uint32_t cap = std::min<uint64_t>(8 * 1024 * 1024, 32 * 1024 * 1024 - state.bytes);
+        if (full_read) cap = std::min<uint64_t>(cap, FULL_READ_BUDGET - state.full_read_bytes);
+        std::vector<uint8_t> body(head ? 1 : cap);
+        char metadata[16384] = {};
+        char failure_reason[64] = {};
+        uint32_t received = 0;
+        ++state.requests;
+        const int length = worker_fetch(address.c_str(), headers.c_str(), head, body.data(), cap,
+            metadata, sizeof(metadata), &received, &state.upstream_status, failure_reason,
+            std::min(10000, static_cast<int>(remaining_ms)));
+        state.bytes += received;
+        if (full_read) state.full_read_bytes += received;
+        request.bytes_received += received;
+        if (length < 0) {
+            if (full_read && std::string(failure_reason) == "response_body_limit") fail(502, "full_download_limit");
+            fail(-length, failure_reason[0] ? failure_reason : "host_fetch_failed");
+        }
+        std::istringstream lines(metadata);
+        std::string line;
+        if (!std::getline(lines, line)) fail(502, "invalid_response_metadata");
+        const auto status = Number(line);
+        auto response = make_uniq<HTTPResponse>(HTTPUtil::ToStatusCode(status));
+        response->url = address;
+        while (std::getline(lines, line)) {
+            const auto colon = line.find(':');
+            if (colon == std::string::npos) fail(502, "invalid_response_metadata");
+            response->headers.Append(line.substr(0, colon), line.substr(colon + 1));
+        }
+        if (status >= 300 && status <= 399) {
+            if (!response->HasHeader("location")) fail(502, "missing_redirect_location");
+            const auto location = response->GetHeaderValue("location");
+            // Absolute redirects must satisfy Rust's optional origin restriction
+            // and path policy. A relative redirect is a defined failure.
+            if (redirects == 2) fail(502, "redirect_limit");
+            if (!eval_url_allowed(state.context, location.data(), location.size())) fail(502, "redirect_policy");
+            address = location; continue;
+        }
+        if (status == 412) fail(502, "object_changed");
+        if (status != 200 && status != 206) state.error_reason = "upstream_http_status";
+        if (status == 200 || status == 206) {
+            const auto etag = response->HasHeader("etag") ? response->GetHeaderValue("etag") : "";
+            // A weak/missing validator selects httpfs's single full snapshot.
+            // Never allow weak validation to assemble bytes from remote ranges.
+            if (!StrongETag(etag)) {
+                if (range) fail(502, etag.empty() ? "missing_etag" : "weak_etag");
+                if (head && response->HasHeader("content-length") &&
+                    Number(response->GetHeaderValue("content-length")) >
+                        FULL_READ_BUDGET - std::min(FULL_READ_BUDGET, state.full_read_bytes))
+                    fail(502, "full_download_limit");
+            }
+            auto found = state.versions.find(address);
+            if (found != state.versions.end() && found->second != etag) fail(502, "object_changed");
+            if (!etag.empty()) state.versions.emplace(address, etag);
+            if (!head && request.headers.HasHeader("Range")) {
+                if (status != 206) fail(502, "range_ignored");
+                if (!response->HasHeader("content-range")) fail(502, "missing_content_range");
+                const auto range = request.headers.GetHeaderValue("Range");
+                const auto actual = response->GetHeaderValue("content-range");
+                const auto dash = range.find('-'), space = actual.find(' '), sep = actual.find('-'), slash = actual.find('/');
+                if (range.rfind("bytes=",0) != 0 || actual.rfind("bytes ",0) != 0 || dash == std::string::npos || sep == std::string::npos || slash == std::string::npos) fail(502, "invalid_content_range");
+                const auto start = Number(actual.substr(space+1,sep-space-1));
+                const auto end = Number(actual.substr(sep+1,slash-sep-1));
+                const auto total = Number(actual.substr(slash+1));
+                if (start != Number(range.substr(6,dash-6)) || end < start || end >= total ||
+                    end-start+1 != static_cast<uint64_t>(length) ||
+                    (dash+1 < range.size() && end > Number(range.substr(dash+1)))) fail(502, "invalid_content_range");
+            }
+        }
+        if (!head) {
+            auto &get = request.Cast<GetRequestInfo>();
+            if (get.response_handler && !get.response_handler(*response)) return response;
+            if (get.content_handler) {
+                if (length && !get.content_handler(body.data(), length)) fail(502, "content_handler_rejected");
+            } else response->body.assign(reinterpret_cast<char *>(body.data()), length);
+        }
+        return response;
+    }
+    fail(502, "redirect_limit");
+    return nullptr;
+}

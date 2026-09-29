@@ -1,0 +1,12 @@
+{
+  "name": "duckdb-rust-workers",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.22.2"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "wrangler": "4.143.0"
+  }
+}

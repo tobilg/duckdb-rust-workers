@@ -1,0 +1,58 @@
+{
+  "generator_version": "v1.5.5",
+  "generator_sha256": "8463eb26527b278109cfddffc4606e1019ebefcfe2eac75efc53c76ed8f282d5",
+  "files": [
+    {
+      "path": "tests/fixtures/small.json",
+      "bytes": 107,
+      "sha256": "0b222d1b997a72a376d2ea80638db8703131343b56f69faafcc410c6b36660dc"
+    },
+    {
+      "path": "tests/fixtures/small.parquet",
+      "bytes": 269630,
+      "sha256": "78558ddab3d0afb339340d1bcd02e4cd8beeecbfd83da1eb8e34d3208d08c324"
+    },
+    {
+      "path": "build/fixtures/large.parquet",
+      "bytes": 137475588,
+      "sha256": "5e919be8b3280a6bba905decc527404980cda965cf03893162c6316d7aaa4891"
+    },
+    {
+      "path": "build/fixtures/reference.duckdb",
+      "bytes": 274432,
+      "sha256": "12503c7882aed3a6e63a68f0123c2abdbad240a961ee88207b068e6ca6053b5c"
+    }
+  ],
+  "queries": [
+    {
+      "sql": "SELECT count(*) AS n, sum(id)::BIGINT AS total FROM read_parquet('tests/fixtures/small.parquet') WHERE id < 1024 AND category='a'",
+      "expected": {
+        "n": 512,
+        "total": 261632
+      }
+    },
+    {
+      "sql": "SELECT count(*) AS n, sum(id)::BIGINT AS total FROM read_parquet('build/fixtures/large.parquet') WHERE id < 1024 AND category='a'",
+      "expected": {
+        "n": 512,
+        "total": 261632
+      }
+    },
+    {
+      "sql": "SELECT sum(value)::BIGINT AS total FROM read_json_auto('tests/fixtures/small.json') WHERE category='a'",
+      "expected": {
+        "total": 40
+      }
+    }
+  ],
+  "large_layout": {
+    "rows": 262144,
+    "row_group_rows": 8192,
+    "columns": [
+      "id BIGINT",
+      "category VARCHAR",
+      "payload VARCHAR (512 bytes)"
+    ],
+    "compression": "UNCOMPRESSED"
+  }
+}

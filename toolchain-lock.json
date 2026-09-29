@@ -1,0 +1,93 @@
+{
+  "host": "Darwin-arm64",
+  "rust": "1.98.0",
+  "node": "22.22.2",
+  "wasm_bindgen": "0.2.129",
+  "emsdk": "6.0.10",
+  "sources": [
+    {
+      "name": "workers-rs",
+      "url": "https://github.com/cloudflare/workers-rs.git",
+      "commit": "b57ba6ef8198c65499c2f92b1845cc2412dd6e8c",
+      "path": "vendor/workers-rs",
+      "patches": [
+        "patches/worker-build-local-cache.patch"
+      ]
+    },
+    {
+      "name": "duckdb",
+      "url": "https://github.com/duckdb/duckdb.git",
+      "commit": "d591bb1da2de3cb12329c75aff2c31bebe922b59",
+      "path": "vendor/duckdb",
+      "overlays": {
+        ".github/patches/extensions/httpfs/0002-wasm-dependencies.patch": "patches/httpfs-wasm-dependencies.patch",
+        ".github/patches/extensions/httpfs/0003-full-snapshot.patch": "patches/httpfs-full-snapshot.patch"
+      }
+    },
+    {
+      "name": "httpfs",
+      "url": "https://github.com/duckdb/duckdb-httpfs.git",
+      "commit": "3f81d9749e538adc6e4882616fb2c9966e0cb0dd",
+      "path": "vendor/httpfs",
+      "patches": [
+        "patches/httpfs-wasm-dependencies.patch",
+        "patches/httpfs-full-snapshot.patch"
+      ]
+    },
+    {
+      "name": "emscripten",
+      "url": "https://github.com/guybedford/emscripten.git",
+      "commit": "5b3d1492ad031a0e75d14d6db644e4ab267b4e6f",
+      "path": ".tools/emscripten"
+    },
+    {
+      "name": "emsdk",
+      "url": "https://github.com/emscripten-core/emsdk.git",
+      "commit": "a2b92777574c2feda07994cd4f1079a3dfc151f8",
+      "path": ".tools/emsdk"
+    }
+  ],
+  "archives": [
+    {
+      "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/deps/node-v24.19.0-darwin-arm64.tar.gz",
+      "path": ".tools/emsdk/downloads/node-v24.19.0-darwin-arm64.tar.gz",
+      "sha256": "8294b7aa9b03997481c06babf1e8b270c859358f27da57a11509afe537ac381d"
+    },
+    {
+      "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/deps/python-3.13.3-0-macos-arm64.tar.gz",
+      "path": ".tools/emsdk/downloads/python-3.13.3-0-macos-arm64.tar.gz",
+      "sha256": "2b0899d7ade9463b0c909ef23aeea27546a4f412637998d817a49718bc2bac19"
+    },
+    {
+      "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/mac/666337b525e673e769121856d175f6f52b8ead64/wasm-binaries-arm64.tar.xz",
+      "path": ".tools/emsdk/downloads/666337b525e673e769121856d175f6f52b8ead64-wasm-binaries-arm64.tar.xz",
+      "sha256": "084896c728d82e44d7aa54afc4a7bf64031dda83f3a4c47ee3164cece247cd76"
+    },
+    {
+      "url": "https://github.com/guybedford/binaryen/releases/download/version_132_jspi_hooks_1/binaryen-version_132_jspi_hooks_1-arm64-macos.tar.gz",
+      "path": ".tools/binaryen.tar.gz",
+      "sha256": "14b860230cd1cb413a1b09e797dcb61b651c5484002f68eb7c69b7e4a05fc47f"
+    },
+    {
+      "url": "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/wasm-bindgen-0.2.129-aarch64-apple-darwin.tar.gz",
+      "path": ".tools/wasm-bindgen.tar.gz",
+      "sha256": "81d4a23d56b3c3eb8187658329116d50e0b228a93b343825fb71f70179051cd1"
+    },
+    {
+      "url": "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-osx-universal.zip",
+      "path": ".tools/fixture-duckdb.zip",
+      "sha256": "7a4bc3a93f7f92f5b40cd09c21afaf98e415c6cb9d9170064993782e779f4115"
+    }
+  ],
+  "additional_checkouts": [
+    {
+      "source": "httpfs",
+      "path": "build/duckdb/_deps/httpfs_extension_fc-src",
+      "patches": [
+        "vendor/duckdb/.github/patches/extensions/httpfs/0001-skip-tests-on-windows.patch",
+        "patches/httpfs-wasm-dependencies.patch",
+        "patches/httpfs-full-snapshot.patch"
+      ]
+    }
+  ]
+}

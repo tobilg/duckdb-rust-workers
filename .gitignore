@@ -67,3 +67,15 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+plans/
+
+# Project-local dependency checkouts and build tools
+vendor/
+.tools/
+target/
+node_modules/
+.wrangler/
+.dev.vars
+artifacts/
+__pycache__/
