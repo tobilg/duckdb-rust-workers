@@ -13,6 +13,15 @@ const unrestrictedPort=await availablePort();
 const unrestrictedBase=`http://127.0.0.1:${unrestrictedPort}`;
 const invalidOriginPort=await availablePort();
 const invalidOriginBase=`http://127.0.0.1:${invalidOriginPort}`;
+const blockPort=await availablePort();
+const blockBase=`http://127.0.0.1:${blockPort}`;
+const transferWorkers=[];
+for(const [name,value,kind='text'] of [['low','1'],['high','128'],['wide','4096'],
+ ['zero','0'],['negative','-1'],['fraction','1.5'],['overflow','4294967296'],['invalid','invalid'],['object','{}','json']]) {
+ const port=await availablePort();
+ transferWorkers.push({name:`transfer-${name}`,value,kind,port,base:`http://127.0.0.1:${port}`});
+}
+const transferBase=name=>transferWorkers.find(w=>w.name===`transfer-${name}`).base;
 const root=resolve(import.meta.dirname,'../..'); process.chdir(root);
 mkdirSync('artifacts/logs',{recursive:true});
 const dir=resolve('build/api-runtime'); mkdirSync(dir,{recursive:true});
@@ -32,11 +41,15 @@ const config :Workerd.Config = (
   ${workerService('evaluation',`,(name="ALLOWED_ORIGIN",text="${fixture.origin}"),(name="ALLOWED_PATH_PREFIX",text="/data/")`)},
   ${workerService('unrestricted','')},
   ${workerService('invalid-origin',',(name="ALLOWED_ORIGIN",text="not-an-origin")')},
+  ${workerService('blocks',',(name="RANGE_CACHE_BLOCK_BYTES",text="65536")')},
+  ${transferWorkers.map(w=>workerService(w.name,`,(name="QUERY_TRANSFER_LIMIT_MIB",${w.kind}="${w.value}")`)).join(',\n')},
   (name="internet",network=(allow=["local"],tlsOptions=(trustedCertificates=[embed "cert.pem"])))
  ],sockets=[
   (name="http",address="127.0.0.1:${port}",http=(),service="evaluation"),
   (name="unrestricted-http",address="127.0.0.1:${unrestrictedPort}",http=(),service="unrestricted"),
-  (name="invalid-origin-http",address="127.0.0.1:${invalidOriginPort}",http=(),service="invalid-origin")
+  (name="invalid-origin-http",address="127.0.0.1:${invalidOriginPort}",http=(),service="invalid-origin"),
+  (name="blocks-http",address="127.0.0.1:${blockPort}",http=(),service="blocks"),
+  ${transferWorkers.map(w=>`(name="${w.name}-http",address="127.0.0.1:${w.port}",http=(),service="${w.name}")`).join(',\n')}
  ]
 );
 `);
@@ -99,6 +112,14 @@ try {
  await check('malformed configured origin remains an error',async()=>{
   assert.equal((await queryAt(invalidOriginBase,'SELECT 42')).status,500);
  });
+ await check('invalid transfer settings fail before network I/O',async()=>{
+  const mark=fixture.requests.length;
+  for(const name of ['zero','negative','fraction','overflow','invalid','object']) {
+   const r=await queryAt(transferBase(name),'SELECT * FROM read_json_auto(?)',[`${fixture.origin}/data/small.json`]);
+   assert.equal(r.status,500,JSON.stringify(r));
+  }
+  assert.equal(fixture.requests.length,mark);
+ });
  await check('four static extensions and local functions',async()=>{
   const r=await query("SELECT extension_name FROM duckdb_extensions() WHERE loaded AND extension_name IN ('core_functions','parquet','json','httpfs') ORDER BY extension_name");
   assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[['core_functions'],['httpfs'],['json'],['parquet']]);
@@ -115,6 +136,16 @@ try {
   assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows[0],[null,true,'9007199254740993','123.45','2026-09-29','2026-09-29 12:34:56','NaN']);assert.equal(r.body.columns[0].name,r.body.columns[1].name);
  });
  await check('prepared scalar parameters',async()=>{const r=await query('SELECT ?::BIGINT + ?::BIGINT, ?::VARCHAR',[2,3,"a'b"]);assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[5,"a'b"]]);});
+ await check('window specializations and numeric/text sorts produce reference answers',async()=>{
+  for(const [sql,expected] of [
+   ['SELECT sum(q)::DOUBLE FROM (SELECT median(i) OVER (ORDER BY i ROWS BETWEEN 500 PRECEDING AND 500 FOLLOWING) q FROM range(200000) r(i))',[[19999900000]]],
+   ['SELECT sum(q)::DOUBLE FROM (SELECT mad(i) OVER (ORDER BY i ROWS BETWEEN 500 PRECEDING AND 500 FOLLOWING) q FROM range(50000) r(i))',[[12437625]]],
+   ['SELECT sum(i)::BIGINT, first(i), last(i) FROM (SELECT i FROM range(500000) r(i) ORDER BY (i*7919)%500000)',[[124999750000,0,482321]]],
+   ["SELECT sum(i)::BIGINT, first(i), last(i) FROM (SELECT i FROM range(100000) r(i) ORDER BY md5(i::VARCHAR))",[[4999950000,5329,40691]]],
+  ]) {
+   const r=await query(sql);assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,expected);
+  }
+ });
  await check('statement and unsupported type policy',async()=>{
   for(const sql of ['SELECT 1; SELECT 2','CREATE TABLE x(i INT)',"INSTALL httpfs","LOAD httpfs","SET threads=2",'SELECT [1,2]']) assert.equal((await query(sql)).status,400,sql);
  });
@@ -148,6 +179,43 @@ try {
  });
  const parquetSQL='SELECT count(*) AS n, sum(id)::BIGINT AS total FROM read_parquet(?) WHERE id < 1024 AND category=?';
  await check('remote Parquet ranges',async()=>{const mark=fixture.requests.length;const r=await query(parquetSQL,[`${fixture.origin}/data/small.parquet`,'a']);assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[512,261632]]);assert(fixture.requests.slice(mark).some(x=>x.range));report.small_parquet=r.body.metrics;});
+ const payloadSQL='SELECT sum(length(payload))::BIGINT FROM read_parquet(?) WHERE id < ?';
+ const transferURL=`${fixture.origin}/data/transfer/large.parquet`;
+ await check('default transfer budget permits over 32 MiB and rejects over 64 MiB',async()=>{
+  const within=await query(payloadSQL,[transferURL,81920]);
+  assert.equal(within.status,200,JSON.stringify(within));assert.deepEqual(within.body.rows,[[81920*512]]);
+  assert(within.body.metrics.fetch_bytes>32*1024*1024&&within.body.metrics.fetch_bytes<=64*1024*1024,JSON.stringify(within));
+  const over=await query(payloadSQL,[transferURL,147456]);
+  assert.equal(over.status,502,JSON.stringify(over));assert.equal(over.body.error.diagnostic.reason,'query_transfer_limit');
+  assert(over.body.metrics.fetch_bytes>56*1024*1024&&over.body.metrics.fetch_bytes<=64*1024*1024,JSON.stringify(over));
+  const again=await query(payloadSQL,[transferURL,81920]);
+  assert.equal(again.status,200,JSON.stringify(again));assert.deepEqual(again.body.rows,within.body.rows);
+  assert.equal(again.body.metrics.fetch_bytes,within.body.metrics.fetch_bytes);
+  report.transfer_limits={default_mib:64,within:within.body.metrics,rejected:over.body.metrics};
+ });
+ await check('configured transfer budget permits over 64 MiB and uses 64-bit bytes',async()=>{
+  const raised=await queryAt(transferBase('high'),payloadSQL,[transferURL,147456]);
+  assert.equal(raised.status,200,JSON.stringify(raised));assert.deepEqual(raised.body.rows,[[147456*512]]);
+  assert(raised.body.metrics.fetch_bytes>64*1024*1024&&raised.body.metrics.fetch_bytes<=128*1024*1024,JSON.stringify(raised));
+  const wide=await queryAt(transferBase('wide'),parquetSQL,[transferURL,'a']);
+  assert.equal(wide.status,200,JSON.stringify(wide));assert.deepEqual(wide.body.rows,[[512,261632]]);
+  report.transfer_limits.raised={limit_mib:128,...raised.body.metrics};
+ });
+ await check('lower transfer budgets bound ranges and cumulative full snapshots',async()=>{
+  const low=(...args)=>queryAt(transferBase('low'),...args);
+  for(const path of ['normal','no-length']) {
+   const r=await low(payloadSQL,[`${fixture.origin}/data/transfer/${path}/large.parquet`,8192]);
+   assert.equal(r.status,502,JSON.stringify(r));assert.equal(r.body.error.diagnostic.reason,'query_transfer_limit');
+   assert(r.body.metrics.fetch_bytes<2*1024*1024,JSON.stringify(r));
+  }
+  const urls=Array.from({length:5},(_,i)=>`${fixture.origin}/data/weak-etag/transfer-${i}/small.parquet`);
+  const sql='SELECT sum(n)::BIGINT FROM ('+urls.map(()=> 'SELECT count(*) n FROM read_parquet(?)').join(' UNION ALL ')+')';
+  const full=await low(sql,urls);
+  assert.equal(full.status,502,JSON.stringify(full));assert.equal(full.body.error.diagnostic.reason,'query_transfer_limit');
+  assert(full.body.metrics.fetch_bytes>0&&full.body.metrics.fetch_bytes<=1024*1024,JSON.stringify(full));
+  const recovered=await low(parquetSQL,[`${fixture.origin}/data/small.parquet`,'a']);
+  assert.equal(recovered.status,200,JSON.stringify(recovered));assert.deepEqual(recovered.body.rows,[[512,261632]]);
+ });
  await check('identity encoding selects strong validators for Parquet ranges',async()=>{
   const mark=fixture.requests.length;
   const r=await query(parquetSQL,[`${fixture.origin}/data/negotiate-encoding/small.parquet`,'a']);
@@ -193,9 +261,82 @@ try {
   assert(cumulative.body.metrics.fetch_bytes>3*1024*1024&&cumulative.body.metrics.fetch_bytes<=4*1024*1024);
   assert.equal((await query('SELECT 42')).status,200);
  });
+ await check('literal and repeated URLs retain one snapshot through prepare and execute',async()=>{
+  for(const mode of ['weak-etag','no-etag']) {
+   const url=`${fixture.origin}/data/${mode}/literal/small.parquet`;
+   for(let repeat=0;repeat<2;repeat++) {
+    const mark=fixture.requests.length;
+    const r=await query(`SELECT sum(n)::BIGINT FROM (SELECT count(*) n FROM '${url}' UNION ALL SELECT count(*) n FROM '${url}')`);
+    assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[32768]]);
+    const requests=fixture.requests.slice(mark);
+    assert.equal(requests.filter(x=>x.method==='HEAD').length,1,JSON.stringify(requests));
+    assert.equal(requests.filter(x=>x.method==='GET').length,1,JSON.stringify(requests));
+    assert.equal(r.body.metrics.fetch_bytes,269630);
+   }
+  }
+ });
+ await check('range cache reuses footer bytes and remains bounded during eviction',async()=>{
+  const url=`${fixture.origin}/data/cache/large.parquet`;
+  const r=await query(parquetSQL,[url,'a']);
+  assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[512,261632]]);
+  assert(r.body.metrics.cache_hits>=30,JSON.stringify(r));
+  assert(r.body.metrics.fetch_count<=5,JSON.stringify(r));
+  assert(r.body.metrics.fetch_bytes<400000,JSON.stringify(r));
+  assert(r.body.metrics.staging_peak_bytes<=262144,JSON.stringify(r));
+  const urls=Array.from({length:18},(_,i)=>`${fixture.origin}/data/cache/evict-${i}/large.parquet`);
+  urls.push(urls[0]);
+  const sql='SELECT sum(n)::BIGINT FROM ('+urls.map(()=>"SELECT sum(id)::BIGINT n FROM read_parquet(?) WHERE id<1024 AND category='a'").join(' UNION ALL ')+')';
+  const evicted=await query(sql,urls);
+  assert.equal(evicted.status,200,JSON.stringify(evicted));assert.deepEqual(evicted.body.rows,[[261632*urls.length]]);
+  assert(evicted.body.metrics.cache_peak_bytes>3.5*1024*1024,JSON.stringify(evicted));
+  assert(evicted.body.metrics.cache_peak_bytes<=4*1024*1024,JSON.stringify(evicted));
+  assert(evicted.body.metrics.fetch_bytes<32*1024*1024);
+  report.range_cache={single:r.body.metrics,eviction:evicted.body.metrics};
+ });
+ await check('error cleanup discards range and full caches before the next request',async()=>{
+  for(const mode of ['normal','weak-etag']) {
+   const url=`${fixture.origin}/data/${mode}/cleanup/small.parquet`;
+   const r=await query(`SELECT CASE WHEN count(*)>0 THEN error('after fetch') END FROM '${url}'`);
+   assert.equal(r.status,400,JSON.stringify(r));
+   const mark=fixture.requests.length;
+   const recovered=await query(parquetSQL,[url,'a']);
+   assert.equal(recovered.status,200,JSON.stringify(recovered));
+   assert(fixture.requests.slice(mark).some(x=>x.method==='GET'&&x.bytes>0));
+  }
+ });
+ await check('optional aligned cache never widens signed query-string ranges',async()=>{
+  for(const signed of [false,true]) {
+   const mark=fixture.requests.length;
+   const url=`${fixture.origin}/data/block-cache/small.parquet${signed?'?X-Amz-Signature=test-marker':''}`;
+   const r=await queryAt(blockBase,parquetSQL,[url,'a']);
+   assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[512,261632]]);
+   const ranges=fixture.requests.slice(mark).filter(x=>x.range);
+   assert(ranges.length>0);
+   const firstStart=Number(/^bytes=(\d+)-/.exec(ranges[0].range)[1]);
+   assert.equal(signed?firstStart:firstStart%65536,signed?269630-16384:0,JSON.stringify(ranges));
+   assert(r.body.metrics.cache_peak_bytes<=4*1024*1024);
+  }
+ });
+ await check('Parquet coalescing trades bounded gap bytes for fewer requests',async()=>{
+  const r=await query('SELECT sum(a+b+c+d)::BIGINT FROM read_parquet(?)',[`${fixture.origin}/data/coalescing.parquet`]);
+  assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[1342095360]]);
+  assert.equal(r.body.metrics.fetch_count,27,JSON.stringify(r));
+  assert.equal(r.body.metrics.fetch_bytes,886540,JSON.stringify(r));
+  report.coalescing=r.body.metrics;
+ });
  await check('changed weak validator rejects the full snapshot and recovers',async()=>{
   const r=await query(parquetSQL,[`${fixture.origin}/data/weak-etag/changing/small.parquet`,'a']);
   assert.equal(r.status,502);assert.equal(r.body.error.diagnostic.reason,'object_changed');
+  assert.equal((await query('SELECT 42')).status,200);
+ });
+ await check('populated range cache cannot combine changed object versions',async()=>{
+  const mark=fixture.requests.length;
+  const r=await query(parquetSQL,[`${fixture.origin}/data/changing-after-download/cache-version/large.parquet`,'a']);
+  assert.equal(r.status,502,JSON.stringify(r));assert.equal(r.body.error.diagnostic.reason,'object_changed');
+  assert(r.body.metrics.cache_peak_bytes>0);
+  const requests=fixture.requests.slice(mark);
+  assert(requests.some(x=>x.range&&x.status===206));
+  assert(requests.some(x=>x.range&&x.status===412&&x.if_match));
   assert.equal((await query('SELECT 42')).status,200);
  });
  await check('object larger than 128 MiB',async()=>{const r=await query(parquetSQL,[`${fixture.origin}/data/large.parquet`,'a']);assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[512,261632]]);assert(r.body.metrics.fetch_bytes<137475588/4);report.large_parquet=r.body.metrics;});
@@ -224,7 +365,7 @@ try {
    assert(diagnostic?.reason,JSON.stringify(r));
    assert(['HEAD','GET'].includes(diagnostic.method));
    assert(r.body.metrics.fetch_count>0);
-   const expected={ignored:'response_body_limit','range-416':'upstream_http_status','bad-range':'invalid_content_range',changing:'object_changed','redirect-denied':'redirect_policy','no-etag':'full_download_limit','weak-etag':'full_download_limit','no-range':'missing_content_range','redirect-missing':'missing_redirect_location','ignored/no-length':'response_body_limit'}[mode];
+   const expected={ignored:'full_download_limit','range-416':'upstream_http_status','bad-range':'invalid_content_range',changing:'object_changed','redirect-denied':'redirect_policy','no-etag':'full_download_limit','weak-etag':'full_download_limit','no-range':'missing_content_range','redirect-missing':'missing_redirect_location','ignored/no-length':'full_download_limit'}[mode];
    if(expected)assert.equal(diagnostic.reason,expected,`${mode}: ${JSON.stringify(r)}`);
    if(mode==='range-416')assert.equal(diagnostic.upstream_status,416);
    if(mode==='reject'){assert.match(diagnostic.reason,/^fetch_(failed|type_error)$/);assert.equal(diagnostic.upstream_status,undefined);}
@@ -243,10 +384,33 @@ try {
   const recovered=await query('SELECT 42');
   assert.equal(recovered.status,200);assert.equal(recovered.body.error,undefined);assert.equal(recovered.body.metrics.fetch_count,0);
  });
- await check('ignored small ranges have an explicit diagnostic',async()=>{
-  const r=await query(parquetSQL,[`${fixture.origin}/data/ignored/small.parquet`,'a']);
-  assert.equal(r.status,502);
-  assert.deepEqual(r.body.error.diagnostic,{reason:'range_ignored',method:'GET',upstream_status:200});
+ await check('ignored ranges use one bounded full snapshot for small objects',async()=>{
+  for(const mode of ['ignored','ignored/no-length','ignored/no-head','ignored/head-no-length/no-length']) {
+   const mark=fixture.requests.length;
+   const url=`${fixture.origin}/data/${mode}/small.parquet`;
+   const r=await query(parquetSQL.replace('read_parquet(?)',`read_parquet('${url}')`),['a']);
+   assert.equal(r.status,200,`${mode}: ${JSON.stringify(r)}`);assert.deepEqual(r.body.rows,[[512,261632]]);
+   const gets=fixture.requests.slice(mark).filter(x=>x.method==='GET');
+   assert.equal(gets.filter(x=>x.range===null).length,1,JSON.stringify(gets));
+   if(!mode.includes('head-no-length')) assert(gets.some(x=>x.range!==null));
+   assert.equal(r.body.metrics.fetch_bytes,269630);
+   assert(gets.filter(x=>x.range===null).every(x=>x.if_match));
+  }
+ });
+ await check('ignored ranges cannot bypass size, version or streaming limits',async()=>{
+  for(const mode of ['ignored','ignored/no-length']) {
+   const mark=fixture.requests.length;
+   const r=await query(parquetSQL,[`${fixture.origin}/data/${mode}/large.parquet`,'a']);
+   assert.equal(r.status,502);assert.equal(r.body.error.diagnostic.reason,'full_download_limit');
+   assert(fixture.requests.slice(mark).every(x=>x.method==='HEAD'||x.range!==null));
+   assert.equal(r.body.metrics.fetch_bytes,0);
+  }
+  const unknown=await query(parquetSQL,[`${fixture.origin}/data/ignored/head-no-length/no-length/large.parquet`,'a']);
+  assert.equal(unknown.status,502,JSON.stringify(unknown));assert.equal(unknown.body.error.diagnostic.reason,'full_download_limit');
+  assert(unknown.body.metrics.fetch_bytes>=4*1024*1024&&unknown.body.metrics.fetch_bytes<5*1024*1024);
+  const changed=await query(parquetSQL,[`${fixture.origin}/data/ignored/changing-after-download/small.parquet`,'a']);
+  assert.equal(changed.status,502,JSON.stringify(changed));assert.equal(changed.body.error.diagnostic.reason,'object_changed');
+  assert.equal((await query('SELECT 42')).status,200);
  });
  await check('allowed redirect',async()=>{const r=await query(parquetSQL,[`${fixture.origin}/data/redirect/small.parquet`,'a']);assert.equal(r.status,200,JSON.stringify(r));assert.deepEqual(r.body.rows,[[512,261632]]);});
  await check('no HEAD and absent content length have bounded outcomes',async()=>{

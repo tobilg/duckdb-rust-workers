@@ -39,6 +39,7 @@ emcmake cmake -S vendor/duckdb -B build/duckdb -G Ninja \
   -DCMAKE_C_FLAGS_MINSIZEREL='-Oz -DNDEBUG -ffunction-sections -fdata-sections' \
   -DCMAKE_CXX_FLAGS_MINSIZEREL='-Oz -DNDEBUG -ffunction-sections -fdata-sections' \
   -DSMALLER_BINARY=ON \
+  "-DSMALLER_BINARY_EXCEPT=${DUCKDB_SMALLER_BINARY_EXCEPT-window_specialization}" \
   '-DBUILD_EXTENSIONS=core_functions;parquet;json;httpfs' \
   -DBUILD_SHELL=OFF -DBUILD_UNITTESTS=OFF -DBUILD_BENCHMARKS=OFF \
   -DDISABLE_THREADS=ON -DUSE_WASM_THREADS=OFF \

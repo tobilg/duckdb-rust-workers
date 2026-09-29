@@ -87,8 +87,37 @@ patch selects its existing `FullDownload`/`CachedFileHandle` path. It fetches
 one complete snapshot and serves subsequent reads from that request-owned
 buffer. All full GETs share a 4 MiB budget, checked against declared lengths
 and while streaming. A known oversized weakly validated object is rejected
-at HEAD. Larger strongly validated files continue to use remote ranges.
+at HEAD. A server that ignores Range returns 200: the host cancels that body,
+then signals upstream's unsupported-range error to select `ReadAtWithFallback`.
+The resulting full GET retains read conditions and the same 4 MiB cumulative
+budget. Known oversized files fail before the full GET; unknown lengths are
+capped while streaming. Malformed 206 responses and changed validators never
+select this fallback. Larger strongly validated files continue to use ranges.
 Response/content callbacks follow the native HTTP request contract.
+
+Owned subclasses of `HTTPState` and the query-local `HTTPMetadataCache` defer
+their `QueryEnd` cleanup to connection destruction. DuckDB ends an internal
+query during preparation; the API request spans preparation and execution.
+This lifetime change preserves upstream's completed snapshot and metadata
+without sharing them across requests. Upstream already checks for a cached
+full file before HEAD, so this needs no additional vendor patch.
+
+The transport also keeps an LRU of validated 206 responses within the request.
+Its 4 MiB budget includes charged entry metadata, and it has at most 64 entries.
+Keys include the exact URL and all effective headers except Range. Subranges
+of cached bytes retain the original strong validator and total size. Network
+counters count actual consumed bytes, while separate counters describe hits
+and peak charged cache storage. Range staging buffers are sized to the wire
+range, capped at 8 MiB; full reads remain capped at 4 MiB. Optional block
+alignment never widens signed/query-string URLs or requests with credential
+headers. This is sequential fetch reuse, not concurrent read-ahead.
+
+Rust reads `QUERY_TRANSFER_LIMIT_MIB` from the deployment bindings, defaulting
+to 64 MiB, validates a positive 32-bit integer, then converts it to a 64-bit
+byte budget before passing it through the owned C ABI. The provider applies
+the remaining cumulative budget to every network body, including full
+snapshots and failed reads. Exceeding it returns `query_transfer_limit` and
+releases the request state. Cached ranges consume no additional transfer.
 
 Only the completed bounded response buffer crosses back into an HTTP
 response. Row limits stop the result stream early; a byte breach discards

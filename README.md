@@ -3,7 +3,7 @@
 DuckDB 2.0 and Rust linked into one Emscripten Wasm module, with synchronous
 native HTTP reads suspended through JSPI and real Workers `fetch()`.
 `core_functions`, `parquet`, `json`, and `httpfs` are statically registered.
-This is a local, trusted-caller evaluation, not a production SQL service.
+This is a trusted-caller evaluation, not a production SQL service.
 
 Validation generates `artifacts/validation-report.md` with acceptance results
 and limitations, and `artifacts/build-manifest.json` with exact pins, flags,
@@ -38,6 +38,8 @@ an existing manifest; it does not create one or run tests.
 The build compiles DuckDB and its four static extensions, then links the Rust
 API into the Worker. Native compilation uses two jobs by default
 (`NATIVE_JOBS=4` to change it).
+`SMALLER_BINARY=ON` retains only the window specializations justified by the
+[benchmarks](docs/performance.md); native compilation and linking still use `-Oz`.
 Subsequent builds are incremental. Testing generates the large fixture using
 the separately pinned native DuckDB 1.5.5 CLI; this is only a fixture generator,
 not the Worker engine. Tests start actual workerd and a local TLS fixture
@@ -56,16 +58,22 @@ compatibility. Publishing an endpoint is outside these commands.
 
 ## Deploy to Cloudflare
 
-Deployment is a separate evaluation step and has not yet been validated on
-Cloudflare. Install the prerequisites from the local workflow above first.
+The project owner confirmed that the public GitHub Parquet example works on a
+deployed Cloudflare Worker. The configurable transfer-budget update has only
+local validation so far. The full deployed acceptance suite, authenticated
+S3 checks and total isolate-memory measurements remain pending.
+
+Install the prerequisites from the local workflow above first.
 Use an authorized Workers Paid test account with a workers.dev subdomain;
 the deploy command below publishes an endpoint and its requests use that
 account's quota.
 
 Use remote Parquet, JSON, or CSV files served over HTTPS to test the Worker.
 Large files require strong ETags and byte-range support. Files with weak or
-missing ETags use one full GET, with a 4 MiB total full-read budget per query.
-DuckDB reads that request-owned snapshot for the rest of the query.
+missing ETags, or servers that ignore Range, use one bounded full GET, with a
+4 MiB total full-read budget per API request. DuckDB reuses that snapshot
+through preparation and execution, including literal URLs and repeated reads.
+Malformed ranges and changed object versions remain errors.
 
 ### Configure the Worker
 
@@ -83,6 +91,24 @@ settings. These commands use the top-level Worker configuration.
   }
 }
 ```
+
+The default query transfer budget is **64 MiB**. To change it, set
+`QUERY_TRANSFER_LIMIT_MIB` in the top-level `vars` in `wrangler.jsonc`:
+
+```jsonc
+{
+  "vars": {
+    "QUERY_TRANSFER_LIMIT_MIB": "128"
+  }
+}
+```
+
+This limits cumulative response-body bytes fetched across all files in one
+query, including failed reads; cache hits consume no transfer budget. It is
+a transfer allowance, not a memory allocation. Use a positive whole number
+of MiB (up to 4,294,967,295); zero, malformed or out-of-range settings return
+a configuration error. Omit the setting to use 64 MiB. Per-response and
+full-download limits are listed under [Budgets and boundaries](#budgets-and-boundaries).
 
 Wrangler runs the configured Rust build and bundles `build/index.js` and
 `build/index_bg.wasm` for upload. Rebuild and rerun local validation before
@@ -147,11 +173,20 @@ and upstream status when a response was received, plus fetch counters in
 `upstream_http_status` reports an HTTP error from the source;
 `fetch_failed`/`fetch_type_error` mean fetch failed before a response;
 `missing_etag`/`weak_etag` identify an unvalidated range response;
-`range_ignored`/`invalid_content_range` identify range failures;
+`invalid_content_range` identifies a malformed range response;
 `response_body_limit` means a response exceeded its transfer cap;
+`query_transfer_limit` means a query exceeded `QUERY_TRANSFER_LIMIT_MIB`;
 `full_download_limit` means a full read would exceed the 4 MiB query budget.
 Diagnostics exclude URLs, credentials, raw headers, and exception messages.
 Retain the complete error JSON when reporting a deployed failure.
+
+Remote range bytes are cached only within the active API request, with a
+4 MiB cache budget. `metrics.cache_hits`, `cache_peak_bytes`, and
+`staging_peak_bytes` describe reuse, accounted cache storage, and the largest
+transport body buffer. They do not measure total isolate memory. Fetch counts
+and bytes include actual network reads, including failed reads; cache hits
+do not increase them. See [performance evaluation](docs/performance.md) for
+benchmarks and optional tuning settings.
 
 The local integration suite is not a deployed test runner. Repeat the large-object and
 error cases against remote test files before claiming deployed
@@ -260,8 +295,9 @@ caught before crossing into Rust. A Wasm trap marks the module unusable.
 | Linear memory / DuckDB managed memory | 96 MiB / 48 MiB |
 | Execution / async threads | 1 / 0 |
 | Spill / external file cache | Disabled / disabled |
-| Response body / query transfer | 8 MiB / 32 MiB |
+| Response body / query transfer | 8 MiB / 64 MiB default (`QUERY_TRANSFER_LIMIT_MIB`) |
 | Full reads and request-owned input snapshots | 4 MiB total per query |
+| Transport range cache | 4 MiB charged storage, at most 64 entries per request |
 | Fetch wait / query I/O deadline | 10 s / 30 s |
 | Fetch concurrency / attempts | 1 / at most 3 including redirects |
 

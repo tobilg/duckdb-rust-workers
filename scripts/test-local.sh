@@ -2,7 +2,7 @@
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
 cd "$PROJECT_ROOT"
-[[ -f build/fixtures/large.parquet && -f build/fixtures/reference.duckdb ]] || python3 scripts/generate-fixtures.py
+[[ -f build/fixtures/large.parquet && -f build/fixtures/reference.duckdb && -f build/fixtures/coalescing.parquet ]] || python3 scripts/generate-fixtures.py
 python3 - <<'PY'
 import hashlib, json
 from pathlib import Path

@@ -1,8 +1,9 @@
 # Build decisions
 
-The source contract is `plans/duckdb-rust-worker-prd.md`. Exact source and
-archive pins are in `toolchain-lock.json`; Cargo and npm dependencies have
-lockfiles. The current evaluated host is macOS arm64.
+The build and API behavior are documented in the [README](../README.md) and
+[architecture notes](architecture.md). Exact source and archive pins are in
+`toolchain-lock.json`; Cargo and npm dependencies have lockfiles. The current
+evaluated host is macOS arm64.
 
 Every vendored modification is declared in `toolchain-lock.json`:
 
@@ -62,6 +63,14 @@ upstream httpfs patch.
   effective. `DUCKDB_NO_THREADS` is applied across native compilation,
   including sibling extension targets. Compiler launchers are explicitly empty:
   the host's optional ccache binary has a broken shared-library dependency.
+* `SMALLER_BINARY=ON` is retained, with
+  `SMALLER_BINARY_EXCEPT=window_specialization`. This preserves the quantile
+  and MAD window implementations that completed the bounded-memory benchmark
+  queries. Sort specializations were evaluated but did not give a repeatable
+  improvement, so their size reduction stays enabled. Set
+  `DUCKDB_SMALLER_BINARY_EXCEPT=''` when reproducing the fully trimmed baseline.
+  This is an upstream CMake option, not a vendor source edit. Measurement audits
+  the effective per-feature compiler flags and records them in the manifest.
 
 Wrangler 4.143.0 pins workerd 1.20260926.1 through its lockfile. The tested
 compatibility date is 2026-09-26, with `new_module_registry` and without
@@ -100,8 +109,11 @@ It routes weak/missing validators through the existing request-scoped cache.
 The adapter caps all full GETs at 4 MiB total per query, rejects known oversized
 weakly validated sources at HEAD, and caps unknown lengths while streaming.
 It checks any known ETag across HEAD/GET and retains native ETag checks.
-Subsequent reads use the single cached byte snapshot. Range-ignored responses
-remain bounded failures; unrestricted automatic full downloads stay disabled.
+Subsequent reads use the single cached byte snapshot. Automatic fallback is
+enabled for ignored ranges, but every full GET passes through the same
+transport budget. The ignored response body is canceled before reading; the
+subsequent conditional full GET is retained by httpfs. A changed version or
+malformed 206 remains a hard error.
 
 The host explicitly sets `Accept-Encoding: identity` for every HEAD/GET,
 including redirects. [Production Workers automatically negotiate compression](https://developers.cloudflare.com/workers/runtime-apis/fetch/#how-the-accept-encoding-header-is-handled)
@@ -128,8 +140,8 @@ associate a test report or dry-run Wasm with a different release hash.
 header at this pin. The adapter checks presence before reading ETag,
 Content-Range or redirect Location, turning malformed upstream responses
 into recoverable 502 errors. Edge tests include all three absent headers,
-weak validators and a range-ignored chunked large response that reaches the
-streaming byte cap without a Content-Length header.
+weak validators and a full fallback that reaches the streaming byte cap when
+neither HEAD nor GET provides Content-Length.
 
 The local test harness asks the OS for free ports and cleans up its own
 workerd process and fixture sockets. It validates the same full API artifact

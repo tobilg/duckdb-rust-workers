@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { once } from 'node:events';
 
 // Real socket/TLS fixture server. No Worker fetch mocking or outbound override.
-export async function startFixtures({ key, cert, root, redirectOrigin }) {
+export async function startFixtures({ key, cert, root, redirectOrigin, latencyMs = 0 }) {
   const manifest = JSON.parse(readFileSync(resolve(root, 'tests/fixtures/manifest.json')));
   const files = new Map(manifest.files.map(f => [f.path.split('/').at(-1), f]));
   const requests = [];
@@ -17,6 +17,7 @@ export async function startFixtures({ key, cert, root, redirectOrigin }) {
     requests.push(record);
     const finish = status => { record.status = status; record.end_ms = performance.now(); };
     res.on('close', () => { record.closed = true; });
+    if (latencyMs) await new Promise(resolve => setTimeout(resolve, latencyMs));
     if (!fixture) { res.writeHead(404).end(); finish(404); return; }
     if (url.pathname.includes('/timeout/')) { return; }
     if (url.pathname.includes('/delay/')) { await new Promise(resolve => setTimeout(resolve, 500)); }

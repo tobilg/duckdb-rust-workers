@@ -76,6 +76,9 @@ vendor/
 target/
 node_modules/
 .wrangler/
+.env
+.env.*
 .dev.vars
+.dev.vars.*
 artifacts/
 __pycache__/

@@ -7,10 +7,21 @@
 #include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/parser/statement/attach_statement.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "http/http_state.hpp"
 
 extern "C" int32_t duckdb_register_static_extensions(void);
 
 namespace {
+// Prepare and Submit are separate DuckDB queries, but one API request. The
+// connection owns this state and destroys it on every success/error return.
+class RequestHTTPState final : public duckdb::HTTPState {
+    void QueryEnd(duckdb::ClientContext &) override {}
+};
+class RequestMetadataCache final : public duckdb::HTTPMetadataCache {
+public:
+    RequestMetadataCache() : HTTPMetadataCache(duckdb::HTTPMetadataCacheMode::QUERY_LOCAL) {}
+    void QueryEnd(duckdb::ClientContext &) override {}
+};
 void Register() {
     static bool registered = false;
     if (!registered) {
@@ -32,7 +43,9 @@ int eval_begin_rows(void *);
 int eval_row_begin(void *);
 int eval_cell(void *, int, const char *, uint32_t);
 int eval_row_end(void *);
-void eval_metrics(void *, uint32_t, uint64_t);
+uint64_t eval_transfer_limit(void *);
+int32_t eval_tuning(void *, uint32_t);
+void eval_metrics(void *, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t);
 void eval_network_error(void *, const char *, uint32_t, uint32_t, uint32_t);
 }
 
@@ -56,11 +69,12 @@ int CellKind(const duckdb::LogicalType &type) {
 
 extern "C" EMSCRIPTEN_KEEPALIVE int bridge_run(void *context, const char *sql) noexcept {
     using namespace duckdb;
-    QueryNetwork network {context, emscripten_get_now() + 30000};
+    QueryNetwork network {context, emscripten_get_now() + 30000, eval_transfer_limit(context)};
+    network.cache_block_bytes = eval_tuning(context,0);
     struct Metrics {
         QueryNetwork &n;
         ~Metrics() {
-            eval_metrics(n.context,n.requests,n.bytes);
+            eval_metrics(n.context,n.requests,n.bytes,n.cache_hits,n.cache_peak_bytes,n.staging_peak_bytes);
             if (!n.error_reason.empty())
                 eval_network_error(n.context,n.error_reason.data(),n.error_reason.size(),n.method,n.upstream_status);
         }
@@ -81,14 +95,21 @@ extern "C" EMSCRIPTEN_KEEPALIVE int bridge_run(void *context, const char *sql) n
         // manager from DBConfig. Install on the live instance before LOAD/http I/O.
         database.instance->config.SetHTTPUtil(provider);
         Connection connection(database);
+        connection.context->registered_state->Insert("http_state",make_shared_ptr<RequestHTTPState>());
+        connection.context->registered_state->Insert("http_cache",make_shared_ptr<RequestMetadataCache>());
         for (const auto *extension : {"core_functions","parquet","json","httpfs"}) {
             auto loaded = connection.Query(std::string("LOAD ") + extension);
             if (loaded->HasError()) loaded->ThrowError();
             if (!database.instance->ExtensionIsLoaded(extension)) return 500;
         }
         if (&database.instance->config.GetHTTPUtil() != provider.get()) return 500;
-        auto settings = connection.Query("SET http_retries=0; SET http_timeout=10; SET auto_fallback_to_full_download=false; SET force_download=false; SET force_download_without_strong_etag=true; SET enable_external_file_cache=false; SET max_execution_time=30000;");
+        auto settings = connection.Query("SET http_retries=0; SET http_timeout=10; SET auto_fallback_to_full_download=true; SET force_download=false; SET force_download_without_strong_etag=true; SET enable_external_file_cache=false; SET max_execution_time=30000;");
         for (auto *r=settings.get(); r; r=r->next.get()) if (r->HasError()) r->ThrowError();
+        const auto gap = eval_tuning(context,1);
+        if (gap >= 0) {
+            auto tuned = connection.Query("SET parquet_prefetch_column_gap=" + std::to_string(gap));
+            if (tuned->HasError()) tuned->ThrowError();
+        }
         auto parsed = connection.ExtractStatements(sql);
         if (parsed.size() != 1) return 400;
         const bool attach = parsed[0]->type == StatementType::ATTACH_STATEMENT;

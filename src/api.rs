@@ -41,6 +41,11 @@ pub struct QueryContext {
     error: u16,
     fetch_count: u32,
     fetch_bytes: u64,
+    cache_hits: u32,
+    cache_peak_bytes: u32,
+    staging_peak_bytes: u32,
+    transfer_limit_bytes: u64,
+    tuning: [i32; 2],
     network_diagnostic: Option<NetworkDiagnostic>,
 }
 struct Budget<'a>(&'a mut Vec<u8>);
@@ -124,6 +129,9 @@ fn error_with_context(id: u32, status: u16, context: Option<&QueryContext>) -> R
         body["metrics"] = serde_json::json!({
             "fetch_count": context.fetch_count,
             "fetch_bytes": context.fetch_bytes,
+            "cache_hits": context.cache_hits,
+            "cache_peak_bytes": context.cache_peak_bytes,
+            "staging_peak_bytes": context.staging_peak_bytes,
         });
     }
     Response::from_json(&body).map(|r| r.with_status(status))
@@ -206,6 +214,36 @@ pub async fn query(mut req: Request, env: Env, id: u32) -> Result<Response> {
         };
         params.push(Parameter { kind, data });
     }
+    // Trusted deployment settings only; clients cannot increase resource budgets.
+    let transfer_setting =
+        js_sys::Reflect::get(&env, &JsValue::from_str("QUERY_TRANSFER_LIMIT_MIB"))?;
+    let transfer_limit_mib = if transfer_setting.is_undefined() {
+        64
+    } else {
+        match transfer_setting
+            .as_string()
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            Some(value) if value > 0 => value,
+            _ => return error(id, 500),
+        }
+    };
+    // -1 disables the range cache / selects DuckDB's adaptive column gap.
+    let mut tuning = [0, 65536];
+    for (index, name) in ["RANGE_CACHE_BLOCK_BYTES", "PARQUET_PREFETCH_COLUMN_GAP"]
+        .iter()
+        .enumerate()
+    {
+        if let Ok(value) = env.var(name) {
+            let Ok(value) = value.to_string().parse::<i32>() else {
+                return error(id, 500);
+            };
+            if !(-1..=1048576).contains(&value) {
+                return error(id, 500);
+            }
+            tuning[index] = value;
+        }
+    }
     let mut context = Box::new(QueryContext {
         params,
         allowed_origin,
@@ -219,6 +257,11 @@ pub async fn query(mut req: Request, env: Env, id: u32) -> Result<Response> {
         error: 0,
         fetch_count: 0,
         fetch_bytes: 0,
+        cache_hits: 0,
+        cache_peak_bytes: 0,
+        staging_peak_bytes: 0,
+        transfer_limit_bytes: u64::from(transfer_limit_mib) * 1024 * 1024,
+        tuning,
         network_diagnostic: None,
     });
     let pointer = (&mut *context as *mut QueryContext) as u32;
@@ -238,8 +281,9 @@ pub async fn query(mut req: Request, env: Env, id: u32) -> Result<Response> {
         return error_with_context(id, status, Some(&context));
     }
     // Reserve in OUTPUT leaves room for this fixed-size trailer.
-    let trailer = format!("],\"truncated\":{},\"request_id\":{},\"metrics\":{{\"wall_ms\":{},\"fetch_count\":{},\"fetch_bytes\":{}}}}}",
-        context.truncated,id,js_sys::Date::now()-start,context.fetch_count,context.fetch_bytes);
+    let trailer = format!("],\"truncated\":{},\"request_id\":{},\"metrics\":{{\"wall_ms\":{},\"fetch_count\":{},\"fetch_bytes\":{},\"cache_hits\":{},\"cache_peak_bytes\":{},\"staging_peak_bytes\":{}}}}}",
+        context.truncated,id,js_sys::Date::now()-start,context.fetch_count,context.fetch_bytes,
+        context.cache_hits,context.cache_peak_bytes,context.staging_peak_bytes);
     context.output.extend_from_slice(trailer.as_bytes());
     let headers = Headers::new();
     headers.set("Content-Type", "application/json")?;
@@ -392,10 +436,28 @@ pub unsafe extern "C" fn eval_row_end(p: *mut QueryContext) -> i32 {
     c.append(b"]") as i32
 }
 #[no_mangle]
-pub unsafe extern "C" fn eval_metrics(p: *mut QueryContext, count: u32, bytes: u64) {
+pub unsafe extern "C" fn eval_transfer_limit(p: *mut QueryContext) -> u64 {
+    context(p).transfer_limit_bytes
+}
+#[no_mangle]
+pub unsafe extern "C" fn eval_tuning(p: *mut QueryContext, index: u32) -> i32 {
+    context(p).tuning.get(index as usize).copied().unwrap_or(-1)
+}
+#[no_mangle]
+pub unsafe extern "C" fn eval_metrics(
+    p: *mut QueryContext,
+    count: u32,
+    bytes: u64,
+    hits: u32,
+    cache: u32,
+    staging: u32,
+) {
     let c = context(p);
     c.fetch_count = count;
     c.fetch_bytes = bytes;
+    c.cache_hits = hits;
+    c.cache_peak_bytes = cache;
+    c.staging_peak_bytes = staging;
 }
 #[no_mangle]
 pub unsafe extern "C" fn eval_network_error(

@@ -21,6 +21,11 @@
       "path": "build/fixtures/reference.duckdb",
       "bytes": 274432,
       "sha256": "12503c7882aed3a6e63a68f0123c2abdbad240a961ee88207b068e6ca6053b5c"
+    },
+    {
+      "path": "build/fixtures/coalescing.parquet",
+      "bytes": 11487480,
+      "sha256": "151e1ace15c4b297a7d1999133270262b62bf29f65a17cadd786e1ccb41955c7"
     }
   ],
   "queries": [
@@ -42,6 +47,12 @@
       "sql": "SELECT sum(value)::BIGINT AS total FROM read_json_auto('tests/fixtures/small.json') WHERE category='a'",
       "expected": {
         "total": 40
+      }
+    },
+    {
+      "sql": "SELECT sum(a+b+c+d)::BIGINT AS total FROM read_parquet('build/fixtures/coalescing.parquet')",
+      "expected": {
+        "total": 1342095360
       }
     }
   ],

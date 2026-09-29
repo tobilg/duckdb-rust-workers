@@ -32,7 +32,23 @@ if Path('build/duckdb/compile_commands.json').exists():
     assert not bad, f'native flag audit failed: {bad[:5]}'
     cxx = [x for x in commands if Path(x['file']).suffix in ['.cpp','.cc','.cxx']]
     assert all('-fwasm-exceptions' in x['command'] and '-sWASM_LEGACY_EXCEPTIONS=0' in x['command'] for x in cxx), 'native C++ exception encoding mismatch'
-    native = {'compile_commands_sha256':digest('build/duckdb/compile_commands.json'), 'entries':len(commands), 'effective_optimization':'-Oz', 'SMALLER_BINARY':'ON', 'no_threads':True, 'native_lto':False, 'flags_audit':'passed'}
+    cache = Path('build/duckdb/CMakeCache.txt').read_text()
+    assert re.search(r'^SMALLER_BINARY:STRING=ON$', cache, re.M), 'SMALLER_BINARY must stay enabled'
+    exceptions = re.search(r'^SMALLER_BINARY_EXCEPT:STRING=(.*)$', cache, re.M).group(1)
+    registry = re.findall(r'^#define DUCKDB_SB_FEATURE_(\w+) +DUCKDB_SB_DEFAULT.*// *group: *(\w+)',
+                          Path('vendor/duckdb/src/include/duckdb/common/smaller_binary.hpp').read_text(), re.M)
+    keep_names = {name.strip() for name in re.split('[,;]', exceptions)}
+    kept = {feature for feature, group in registry if feature in keep_names or group in keep_names or 'all' in keep_names}
+    trimmed = {feature for feature, _ in registry} - kept
+    for entry in cxx:
+        flags = entry['command']
+        if not kept:
+            assert '-DDUCKDB_SMALLER_BINARY_ALL' in flags, entry['file']
+        else:
+            assert '-DDUCKDB_SMALLER_BINARY_ALL' not in flags, entry['file']
+            actual = set(re.findall(r'-DDUCKDB_SB_FEATURE_(\w+)=DUCKDB_SB_ON', flags))
+            assert actual == trimmed, f"Specialization flag mismatch: {entry['file']}"
+    native = {'compile_commands_sha256':digest('build/duckdb/compile_commands.json'), 'entries':len(commands), 'effective_optimization':'-Oz', 'SMALLER_BINARY':'ON', 'SMALLER_BINARY_EXCEPT':exceptions, 'retained_specializations':sorted(kept), 'no_threads':True, 'native_lto':False, 'flags_audit':'passed'}
 manifest = {
     'generated_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
     'host':{'system':platform.system(),'architecture':platform.machine(),'release':platform.release()},

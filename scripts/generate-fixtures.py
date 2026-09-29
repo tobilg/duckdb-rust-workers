@@ -22,6 +22,7 @@ directory.mkdir(parents=True, exist_ok=True)
 large = root / 'build/fixtures/large.parquet'
 large.parent.mkdir(parents=True, exist_ok=True)
 reference = root / 'build/fixtures/reference.duckdb'
+coalescing = root / 'build/fixtures/coalescing.parquet'
 reference.unlink(missing_ok=True)
 (directory / 'small.json').write_text('[{"id":1,"category":"a","value":10},{"id":2,"category":"b","value":20},{"id":3,"category":"a","value":30}]\n')
 # Filenames are fixed project-owned paths, not caller input.
@@ -36,18 +37,24 @@ TO 'tests/fixtures/small.parquet' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED, ROW
 COPY (SELECT i::BIGINT AS id, CASE WHEN i%2=0 THEN 'a' ELSE 'b' END AS category,
   repeat(md5(i::VARCHAR),16) AS payload FROM range(262144) t(i))
 TO 'build/fixtures/large.parquet' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED, ROW_GROUP_SIZE 8192);
+COPY (SELECT i::BIGINT AS a, substr(md5(i::VARCHAR),1,16) AS gap_small,
+  (i*2)::BIGINT AS b, repeat(md5(i::VARCHAR),4) AS gap_medium,
+  (i*3)::BIGINT AS c, repeat(md5(i::VARCHAR),16) AS gap_large,
+  (i*4)::BIGINT AS d FROM range(16384) t(i))
+TO 'build/fixtures/coalescing.parquet' (FORMAT PARQUET, COMPRESSION UNCOMPRESSED, ROW_GROUP_SIZE 2048);
 ATTACH 'build/fixtures/reference.duckdb' AS fixture;
 CREATE TABLE fixture.answer AS SELECT 42 AS value;
 DETACH fixture;
 """)
 assert large.stat().st_size > 128 * 1024 * 1024
 files = []
-for path in [directory / 'small.json', directory / 'small.parquet', large, reference]:
+for path in [directory / 'small.json', directory / 'small.parquet', large, reference, coalescing]:
     files.append({'path': str(path.relative_to(root)), 'bytes': path.stat().st_size, 'sha256': hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()})
 queries = [
     ("SELECT count(*) AS n, sum(id)::BIGINT AS total FROM read_parquet('tests/fixtures/small.parquet') WHERE id < 1024 AND category='a'", {'n':512,'total':261632}),
     ("SELECT count(*) AS n, sum(id)::BIGINT AS total FROM read_parquet('build/fixtures/large.parquet') WHERE id < 1024 AND category='a'", {'n':512,'total':261632}),
     ("SELECT sum(value)::BIGINT AS total FROM read_json_auto('tests/fixtures/small.json') WHERE category='a'", {'total':40}),
+    ("SELECT sum(a+b+c+d)::BIGINT AS total FROM read_parquet('build/fixtures/coalescing.parquet')", {'total':1342095360}),
 ]
 for query, expected in queries:
     assert json.loads(sql(query))[0] == expected

@@ -4,6 +4,7 @@
   "main": "build/index.js",
   "compatibility_date": "2026-09-26",
   "compatibility_flags": ["new_module_registry"],
+  "vars": { "QUERY_TRANSFER_LIMIT_MIB": "64" },
   "build": { "command": "./scripts/build-worker.sh" },
   "limits": { "cpu_ms": 30000 }
 }
